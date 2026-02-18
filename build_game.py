@@ -1,0 +1,1084 @@
+#!/usr/bin/env python3
+"""
+Zombie Survival — singleplayer DayZ-like, built on the Axiom engine.
+
+Large open world with towns, forests, military zones, and ambient zombies.
+
+Run the engine first:
+    cd axiom && cargo run
+
+Then build the game:
+    cd zombie-game && python build_game.py
+"""
+
+import sys
+import random
+import math
+import time
+from pathlib import Path
+from axiom_client import AxiomClient
+from PIL import Image, ImageDraw
+
+
+# ── Mode ────────────────────────────────────────────────────────────
+TILE_TEST_MODE = True  # True = small map, no scripts/zombies/loot, ground tiles only
+
+# ── Map dimensions ──────────────────────────────────────────────────
+TILE_SIZE = 32
+MAP_W, MAP_H = (40, 40) if TILE_TEST_MODE else (200, 140)
+
+# ── Isometric tile dimensions ────────────────────────────────────────
+ISO_TILE_W = 128   # Diamond base width (pixels)
+ISO_TILE_H = 64    # Diamond base height (pixels)
+
+
+def iso_grid_to_world(col, row):
+    """Convert grid (col, row) to isometric world (x, y) — matches engine's grid_to_world."""
+    x = (col - row) * ISO_TILE_W * 0.5
+    y = (col + row) * ISO_TILE_H * 0.5
+    return (x, y)
+
+
+def load_script(client, name, path, global_script=False):
+    source = Path(path).read_text()
+    result = client.post("/scripts", {"name": name, "source": source, "global": global_script})
+    if not result.get("ok"):
+        print(f"  ERROR loading script '{name}': {result.get('error')}")
+        return False
+    return True
+
+
+# ── World Generation ────────────────────────────────────────────────
+
+def generate_world(width, height, seed=42):
+    """Generate terrain using A1 (dirt) and G1-G10 (grass variants).
+
+    Tile IDs:
+      0  = empty
+      1  = A1  (full dirt)
+      2  = G1  (full grass)
+      3  = G2  (dirt edge N)
+      4  = G3  (dirt edge E)
+      5  = G4  (dirt edge S)
+      6  = G5  (dirt edge W)
+      7  = G6  (dirt corner NE)
+      8  = G7  (dirt corner SE)
+      9  = G8  (dirt corner SW)
+      10 = G9  (dirt corner NW)
+      11 = G10 (sparse grass / mostly dirt)
+    """
+    rng = random.Random(seed)
+    T_DIRT = 8          # A1
+    T_GRASS = 9         # G1 full grass
+    T_EDGE_N = 10       # G2
+    T_EDGE_E = 11       # G3
+    T_EDGE_S = 12       # G4
+    T_EDGE_W = 13       # G5
+    T_CORNER_NE = 14    # G6
+    T_CORNER_SE = 15    # G7
+    T_CORNER_SW = 16    # G8
+    T_CORNER_NW = 17    # G9
+    T_SPARSE = 18       # G10
+
+    def idx(tx, ty):
+        return ty * width + tx
+
+    # Step 1: Generate a grass/dirt base map using overlapping blobs
+    # Start with all dirt, add grass patches
+    is_grass = [False] * (width * height)
+
+    # Several grass blobs of varying size for organic terrain
+    blobs = []
+    for _ in range(12):
+        cx = rng.randint(3, width - 4)
+        cy = rng.randint(3, height - 4)
+        rx = rng.randint(4, 12)
+        ry = rng.randint(4, 12)
+        blobs.append((cx, cy, rx, ry))
+
+    for y in range(height):
+        for x in range(width):
+            for cx, cy, rx, ry in blobs:
+                # Elliptical distance with slight noise for organic edges
+                dx = (x - cx) / rx
+                dy = (y - cy) / ry
+                dist = dx * dx + dy * dy
+                # Add jitter to edges
+                jitter = rng.random() * 0.3
+                if dist < 1.0 + jitter:
+                    is_grass[idx(x, y)] = True
+                    break
+
+    # Step 2: Assign tile IDs based on grass/dirt and neighbor analysis
+    tiles = [0] * (width * height)
+
+    def grass_at(tx, ty):
+        if tx < 0 or ty < 0 or tx >= width or ty >= height:
+            return False
+        return is_grass[idx(tx, ty)]
+
+    for y in range(height):
+        for x in range(width):
+            if not is_grass[idx(x, y)]:
+                # This is a dirt tile. Check if any neighbor is grass
+                # to maybe use sparse grass (G10) as a soft transition
+                grass_neighbors = sum([
+                    grass_at(x, y-1), grass_at(x, y+1),
+                    grass_at(x-1, y), grass_at(x+1, y),
+                ])
+                if grass_neighbors >= 1 and rng.random() < 0.3:
+                    tiles[idx(x, y)] = T_SPARSE  # scattered grass near edges
+                else:
+                    tiles[idx(x, y)] = T_DIRT
+                continue
+
+            # This is a grass tile — check which neighbors are dirt
+            n = not grass_at(x, y - 1)  # dirt to north?
+            s = not grass_at(x, y + 1)  # dirt to south?
+            e = not grass_at(x + 1, y)  # dirt to east?
+            w = not grass_at(x - 1, y)  # dirt to west?
+
+            if not n and not s and not e and not w:
+                tiles[idx(x, y)] = T_GRASS  # G1: fully surrounded by grass
+            # Single edges
+            elif n and not s and not e and not w:
+                tiles[idx(x, y)] = T_EDGE_N
+            elif not n and not s and e and not w:
+                tiles[idx(x, y)] = T_EDGE_E
+            elif not n and s and not e and not w:
+                tiles[idx(x, y)] = T_EDGE_S
+            elif not n and not s and not e and w:
+                tiles[idx(x, y)] = T_EDGE_W
+            # Corners (two adjacent dirt edges)
+            elif n and e:
+                tiles[idx(x, y)] = T_CORNER_NE
+            elif s and e:
+                tiles[idx(x, y)] = T_CORNER_SE
+            elif s and w:
+                tiles[idx(x, y)] = T_CORNER_SW
+            elif n and w:
+                tiles[idx(x, y)] = T_CORNER_NW
+            else:
+                # Narrow strip or isolated — use sparse
+                tiles[idx(x, y)] = T_SPARSE
+
+    return tiles
+
+
+# Walkable tile types (all ground tiles are walkable)
+WALKABLE_TILES = set(range(19))  # 0-18 all walkable
+
+
+def find_zombie_spawns(tiles, width, height, player_spawn, count, rng, min_dist=80):
+    """Find random walkable tiles for zombie placement, away from player."""
+    px, py = player_spawn
+    spawns = []
+    for _ in range(count * 50):
+        tx = rng.randint(2, width - 3)
+        ty = rng.randint(2, height - 3)
+        if tiles[ty * width + tx] not in WALKABLE_TILES:
+            continue
+        wx, wy = iso_grid_to_world(tx, ty)
+        dist = math.sqrt((wx - px) ** 2 + (wy - py) ** 2)
+        if dist >= min_dist:
+            spawns.append((wx, wy))
+            if len(spawns) >= count:
+                break
+    return spawns
+
+
+def find_loot_spawns(tiles, width, height, rng, count=20):
+    """Find floor tiles near walls (inside buildings) for loot placement."""
+    solid_tiles = {1, 10}  # wall, fence
+    candidates = []
+    for ty in range(2, height - 2):
+        for tx in range(2, width - 2):
+            tile = tiles[ty * width + tx]
+            if tile not in WALKABLE_TILES:
+                continue
+            # Check if adjacent to a wall (likely inside a building)
+            adj_walls = 0
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                if tiles[(ty + dy) * width + (tx + dx)] in solid_tiles:
+                    adj_walls += 1
+            if adj_walls >= 2:
+                candidates.append(iso_grid_to_world(tx, ty))
+    rng.shuffle(candidates)
+    return candidates[:count]
+
+
+# ── Decoration placement ───────────────────────────────────────────
+
+def find_decoration_positions(tiles, width, height, rng):
+    """Scan generated tiles to find positions for decoration entities.
+    Returns dict of category -> list of (world_x, world_y) positions.
+    Also modifies tiles in-place: converts some tree solid tiles to grass.
+    """
+    tree_positions = []
+    car_positions = []
+    flora_positions = []
+    object_positions = []
+    fence_entity_positions = []
+
+    def idx(tx, ty):
+        return ty * width + tx
+
+    def get(tx, ty):
+        if 0 <= tx < width and 0 <= ty < height:
+            return tiles[idx(tx, ty)]
+        return 1
+
+    def count_neighbors(tx, ty, tile_type):
+        """Count orthogonal + diagonal neighbors of given type."""
+        n = 0
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                if dx == 0 and dy == 0:
+                    continue
+                if get(tx + dx, ty + dy) == tile_type:
+                    n += 1
+        return n
+
+    # Tile constants (must match generate_world)
+    T_WALL = 1
+    T_GRASS = 2
+    T_EARTH_DARK = 3
+    T_ROAD = 6
+    T_GRAVEL = 7
+    T_FLOOR = 9
+    T_FENCE = 10
+
+    # ── Trees: find isolated solid tiles (scattered forest, not building walls) ──
+    tree_candidates = []
+    for ty in range(2, height - 2):
+        for tx in range(2, width - 2):
+            if tiles[idx(tx, ty)] != T_WALL:
+                continue
+            solid_neighbors = count_neighbors(tx, ty, T_WALL)
+            floor_neighbors = count_neighbors(tx, ty, T_FLOOR)
+            if floor_neighbors == 0 and solid_neighbors <= 3:
+                tree_candidates.append((tx, ty))
+
+    rng.shuffle(tree_candidates)
+    for i, (tx, ty) in enumerate(tree_candidates):
+        tiles[idx(tx, ty)] = T_EARTH_DARK  # Remove wall tile — earth underneath (forest)
+        if i < 250:
+            wx, wy = iso_grid_to_world(tx, ty)
+            tree_positions.append((wx, wy))
+
+    # ── Cars: place along roads near buildings ──
+    car_candidates = []
+    for ty in range(2, height - 2):
+        for tx in range(2, width - 2):
+            if tiles[idx(tx, ty)] != T_ROAD:
+                continue
+            near_building = False
+            for dx in range(-5, 6):
+                for dy in range(-5, 6):
+                    if get(tx + dx, ty + dy) == T_WALL:
+                        near_building = True
+                        break
+                if near_building:
+                    break
+            if near_building:
+                car_candidates.append((tx, ty))
+    rng.shuffle(car_candidates)
+    # Space cars out (min 8 tiles apart)
+    for tx, ty in car_candidates:
+        wx, wy = iso_grid_to_world(tx, ty)
+        too_close = False
+        for cx, cy in car_positions:
+            if abs(wx - cx) < 8 * ISO_TILE_W and abs(wy - cy) < 8 * ISO_TILE_H:
+                too_close = True
+                break
+        if not too_close:
+            car_positions.append((wx, wy))
+            if len(car_positions) >= 20:
+                break
+
+    # ── Flora: scatter on grass tiles, away from buildings ──
+    flora_candidates = []
+    for ty in range(2, height - 2):
+        for tx in range(2, width - 2):
+            if tiles[idx(tx, ty)] != T_GRASS:
+                continue
+            wall_near = False
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
+                    if get(tx + dx, ty + dy) in (T_WALL, T_FENCE):
+                        wall_near = True
+                        break
+                if wall_near:
+                    break
+            if not wall_near:
+                flora_candidates.append((tx, ty))
+    rng.shuffle(flora_candidates)
+    for tx, ty in flora_candidates[:200]:
+        wx, wy = iso_grid_to_world(tx, ty)
+        flora_positions.append((wx, wy))
+
+    # ── Objects: scatter inside buildings (floor tiles adjacent to 2+ walls) ──
+    obj_candidates = []
+    for ty in range(2, height - 2):
+        for tx in range(2, width - 2):
+            if tiles[idx(tx, ty)] != T_FLOOR:
+                continue
+            wall_count = 0
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                if get(tx + dx, ty + dy) == T_WALL:
+                    wall_count += 1
+            if wall_count >= 2:  # Corner of a room
+                obj_candidates.append((tx, ty))
+    rng.shuffle(obj_candidates)
+    for tx, ty in obj_candidates[:50]:
+        wx, wy = iso_grid_to_world(tx, ty)
+        object_positions.append((wx, wy))
+
+    return {
+        "trees": tree_positions,
+        "cars": car_positions,
+        "flora": flora_positions,
+        "objects": object_positions,
+    }
+
+
+# ── Zone definitions for zombie density ─────────────────────────────
+
+ZONES = [
+    {"name": "town", "cx": 100, "cy": 70, "radius": 140, "density": 0.8},
+    {"name": "military", "cx": 170, "cy": 22, "radius": 120, "density": 1.5},
+    {"name": "industrial", "cx": 25, "cy": 55, "radius": 110, "density": 0.6},
+    {"name": "farm", "cx": 35, "cy": 115, "radius": 110, "density": 0.3},
+    {"name": "residential", "cx": 170, "cy": 110, "radius": 110, "density": 0.5},
+]
+
+
+# ── Main build ──────────────────────────────────────────────────────
+
+def build_game(client, seed=42):
+    post = client.post
+    get = client.get
+    rng = random.Random(seed)
+
+    print("=== ZOMBIE SURVIVAL — DayZ Edition ===\n")
+
+    # 0. Cleanup
+    print("0. Cleaning up...")
+    try:
+        post("/debug/overlay", {"show": True, "features": ["hitboxes", "colliders"]})
+    except Exception:
+        pass
+    try:
+        client.delete("/scripts/errors")
+    except Exception:
+        pass
+
+    # 1. Top-down physics with isometric rendering
+    print("1. Configuring top-down physics (isometric)...")
+    post("/config", {
+        "gravity": {"x": 0, "y": 0},
+        "move_speed": 200,
+        "tile_size": TILE_SIZE,
+        "tile_mode": {"isometric": {"tile_width": ISO_TILE_W, "tile_height": ISO_TILE_H, "depth_sort": True}},
+        "jump_velocity": 0,
+        "fall_multiplier": 1.0,
+        "coyote_frames": 0,
+        "jump_buffer_frames": 0,
+        "pixel_snap": True,
+        "interpolate_transforms": True,
+        "debug_mode": True,
+        "screenshot_path": "C:/Users/cobra/zombie-game/screenshots",
+        "asset_path": "C:/Users/cobra/zombie-game/assets",
+    })
+
+    # 1a. Background color — olive green to match tileset aesthetic
+    post("/window", {"background": [0.38, 0.40, 0.30]})
+
+    # 1b. Register custom tile types with isometric tilesets
+    print("   Registering tile types with tilesets...")
+    gen = "sprites/tilesets/generated"
+
+    def ground_tileset(name):
+        return {"path": f"{gen}/{name}", "tile_width": 128, "tile_height": 256, "columns": 1, "rows": 1}
+
+    # IDs 0-7 are reserved (engine hardcodes: 0=Empty, 1=Solid, 3=Goal, etc.)
+    # Ground tiles start at ID 8 to avoid built-in collision/teleport behavior.
+    #
+    # Tile IDs:
+    #   0-7  = engine reserved (filled with dummy walkable entries)
+    #   8    = A1  (full dirt)
+    #   9    = G1  (full grass)
+    #   10   = G2  (dirt edge N)
+    #   11   = G3  (dirt edge E)
+    #   12   = G4  (dirt edge S)
+    #   13   = G5  (dirt edge W)
+    #   14   = G6  (dirt corner NE)
+    #   15   = G7  (dirt corner SE)
+    #   16   = G8  (dirt corner SW)
+    #   17   = G9  (dirt corner NW)
+    #   18   = G10 (sparse grass on dirt)
+    tile_types = []
+    # 0-7: reserved slots (all walkable, no tileset — won't be used)
+    for i in range(8):
+        tile_types.append({"name": f"reserved_{i}", "flags": 0, "color": None})
+    # 8: A1 dirt
+    tile_types.append({"name": "dirt", "flags": 0, "color": [0.30, 0.25, 0.18],
+                        "tileset": ground_tileset("Ground_A1.png")})
+    # 9-18: G1-G10
+    for i in range(1, 11):
+        tile_types.append({
+            "name": f"grass_g{i}",
+            "flags": 0,
+            "color": [0.35, 0.52, 0.28],
+            "tileset": ground_tileset(f"Ground_G{i}.png"),
+        })
+    post("/config/tile_types", {"types": tile_types})
+
+    # 2. Generate world
+    print(f"2. Generating {MAP_W}x{MAP_H} open world (isometric)...")
+    tiles = generate_world(MAP_W, MAP_H, seed)
+    spawn_x, spawn_y = iso_grid_to_world(MAP_W // 2, MAP_H // 2)
+    print(f"   Player spawn: ({spawn_x:.0f}, {spawn_y:.0f})")
+
+    # 2b. Decorations disabled — focusing on ground tiles only
+    decorations = {"trees": [], "cars": [], "flora": [], "objects": []}
+
+    # 3. Load level
+    print("3. Loading level...")
+    post("/level", {
+        "width": MAP_W,
+        "height": MAP_H,
+        "tiles": tiles,
+        "player_spawn": [spawn_x, spawn_y],
+        "goal": [int(v) for v in iso_grid_to_world(1, 1)],
+    })
+
+    # 4. Clear entities
+    print("4. Clearing entities...")
+    try:
+        post("/entities/reset_non_player", {})
+    except Exception:
+        pass
+    for e in (get("/entities").get("data") or []):
+        try:
+            client.delete(f"/entities/{e['id']}")
+        except Exception:
+            pass
+
+    # 5. Upload scripts
+    print("5. Uploading scripts...")
+    scripts_dir = Path(__file__).parent / "scripts"
+    scripts = [
+        ("zombie_ai", "zombie_ai.lua", False),
+        ("zombie_manager", "zombie_manager.lua", True),
+        ("player_combat", "player_combat.lua", False),
+        ("game_rules", "game_rules.lua", True),
+        ("game_restart", "game_restart.lua", True),
+    ]
+    for name, filename, is_global in scripts:
+        path = scripts_dir / filename
+        if path.exists():
+            ok = load_script(client, name, str(path), global_script=is_global)
+            print(f"   {'OK' if ok else 'FAIL'}: {name} ({'global' if is_global else 'entity'})")
+        else:
+            print(f"   SKIP: {filename} (not found)")
+
+    # 6. HUD
+    print("6. Creating HUD...")
+    post("/ui/screens", {
+        "name": "hud",
+        "layer": 0,
+        "nodes": [
+            # Health bar
+            {
+                "id": "health_bar",
+                "node_type": {"type": "progress_bar", "value": 10, "max": 10, "color": "red", "bg_color": "dark_red"},
+                "position": {"Anchored": {"anchor": "top_left", "offset": [16, 16]}},
+                "size": {"fixed": [160, 14]},
+            },
+            {
+                "id": "health_text",
+                "node_type": {"type": "text", "text": "HP: 10 / 10", "font_size": 11, "color": "white"},
+                "position": {"Anchored": {"anchor": "top_left", "offset": [16, 34]}},
+            },
+            # Stamina bar
+            {
+                "id": "stamina_bar",
+                "node_type": {"type": "progress_bar", "value": 100, "max": 100, "color": "yellow", "bg_color": "gray"},
+                "position": {"Anchored": {"anchor": "top_left", "offset": [16, 52]}},
+                "size": {"fixed": [120, 8]},
+            },
+            # Kills / score
+            {
+                "id": "kills_label",
+                "node_type": {"type": "text", "text": "Kills: 0", "font_size": 14, "color": "white"},
+                "position": {"Anchored": {"anchor": "top_right", "offset": [-16, 16]}},
+            },
+            {
+                "id": "score_label",
+                "node_type": {"type": "text", "text": "Score: 0", "font_size": 14, "color": "white"},
+                "position": {"Anchored": {"anchor": "top_right", "offset": [-16, 34]}},
+            },
+            # Survival time
+            {
+                "id": "time_label",
+                "node_type": {"type": "text", "text": "0:00", "font_size": 16, "color": "white"},
+                "position": {"Anchored": {"anchor": "top_right", "offset": [-16, 54]}},
+            },
+            # Zone indicator
+            {
+                "id": "zone_label",
+                "node_type": {"type": "text", "text": "Town Center", "font_size": 12, "color": "yellow"},
+                "position": {"Anchored": {"anchor": "bottom_left", "offset": [16, -16]}},
+            },
+            # Zombie count nearby
+            {
+                "id": "threat_label",
+                "node_type": {"type": "text", "text": "", "font_size": 11, "color": "red"},
+                "position": {"Anchored": {"anchor": "bottom_left", "offset": [16, -32]}},
+            },
+            # Weapon info
+            {
+                "id": "weapon_label",
+                "node_type": {"type": "text", "text": "Fists", "font_size": 12, "color": "white"},
+                "position": {"Anchored": {"anchor": "bottom_right", "offset": [-16, -16]}},
+            },
+            # Pickup notification
+            {
+                "id": "pickup_text",
+                "node_type": {"type": "text", "text": "", "font_size": 14, "color": "green"},
+                "position": {"Anchored": {"anchor": "bottom_center", "offset": [0, -52]}},
+            },
+        ],
+    })
+    post("/ui/screens/hud/show")
+
+    # 6b. Particle presets
+    print("   Defining particle presets...")
+    post("/particles/presets", {
+        "name": "blood",
+        "preset": {
+            "color_start": [0.8, 0.1, 0.1, 1.0],
+            "color_end": [0.5, 0.0, 0.0, 0.0],
+            "size_start": 3.0,
+            "size_end": 1.0,
+            "lifetime": 0.4,
+            "speed_min": 30.0,
+            "speed_max": 80.0,
+            "spread_angle": 360.0,
+            "one_shot": True,
+            "burst_count": 12,
+            "gravity_multiplier": 0.0,
+        },
+    })
+    post("/particles/presets", {
+        "name": "slash",
+        "preset": {
+            "color_start": [1.0, 1.0, 0.8, 1.0],
+            "color_end": [1.0, 0.8, 0.2, 0.0],
+            "size_start": 4.0,
+            "size_end": 1.0,
+            "lifetime": 0.15,
+            "speed_min": 60.0,
+            "speed_max": 120.0,
+            "spread_angle": 45.0,
+            "one_shot": True,
+            "burst_count": 6,
+            "gravity_multiplier": 0.0,
+        },
+    })
+    post("/particles/presets", {
+        "name": "heal",
+        "preset": {
+            "color_start": [0.2, 1.0, 0.3, 1.0],
+            "color_end": [0.1, 0.8, 0.2, 0.0],
+            "size_start": 3.0,
+            "size_end": 0.5,
+            "lifetime": 0.6,
+            "speed_min": 10.0,
+            "speed_max": 40.0,
+            "spread_angle": 360.0,
+            "one_shot": True,
+            "burst_count": 8,
+            "gravity_multiplier": -0.5,
+        },
+    })
+
+    # 7. Game Over screen
+    print("7. Creating Game Over screen...")
+    post("/ui/screens", {
+        "name": "game_over",
+        "layer": 10,
+        "nodes": [
+            {
+                "id": "game_over_bg",
+                "node_type": {"type": "panel", "color": "#000000AA"},
+                "position": {"Anchored": {"anchor": "center", "offset": [0, 0]}},
+                "size": {"fixed": [400, 250]},
+                "children": [
+                    {
+                        "id": "game_over_title",
+                        "node_type": {"type": "text", "text": "YOU DIED", "font_size": 48, "color": "red"},
+                        "position": {"Anchored": {"anchor": "top_left", "offset": [100, 20]}},
+                    },
+                    {
+                        "id": "survived_time",
+                        "node_type": {"type": "text", "text": "Survived: 0:00", "font_size": 22, "color": "white"},
+                        "position": {"Anchored": {"anchor": "top_left", "offset": [120, 80]}},
+                    },
+                    {
+                        "id": "final_kills",
+                        "node_type": {"type": "text", "text": "Zombies killed: 0", "font_size": 18, "color": "white"},
+                        "position": {"Anchored": {"anchor": "top_left", "offset": [110, 120]}},
+                    },
+                    {
+                        "id": "final_score",
+                        "node_type": {"type": "text", "text": "Score: 0", "font_size": 18, "color": "white"},
+                        "position": {"Anchored": {"anchor": "top_left", "offset": [140, 155]}},
+                    },
+                    {
+                        "id": "restart_hint",
+                        "node_type": {"type": "text", "text": "", "font_size": 16, "color": "yellow"},
+                        "position": {"Anchored": {"anchor": "top_left", "offset": [95, 200]}},
+                    },
+                ],
+            },
+        ],
+    })
+    post("/ui/screens/game_over/hide")
+
+    # 7b. Register sprite sheets for 8-directional character
+    print("   Registering sprite sheets...")
+    bat_anims = {
+        "idle":           {"path": "sprites/character_with_bat/Idle.png",          "frames": list(range(15)), "fps": 10, "looping": True},
+        "run":            {"path": "sprites/character_with_bat/Run.png",           "frames": list(range(15)), "fps": 12, "looping": True},
+        "walk":           {"path": "sprites/character_with_bat/Walk.png",          "frames": list(range(15)), "fps": 10, "looping": True},
+        "strafe_left":    {"path": "sprites/character_with_bat/StrafeLeft.png",    "frames": list(range(15)), "fps": 12, "looping": True},
+        "strafe_right":   {"path": "sprites/character_with_bat/StrafeRight.png",   "frames": list(range(15)), "fps": 12, "looping": True},
+        "run_backwards":  {"path": "sprites/character_with_bat/RunBackwards.png",  "frames": list(range(15)), "fps": 12, "looping": True},
+        "attack": {"path": "sprites/character_with_bat/Attack3.png",    "frames": list(range(15)), "fps": 22, "looping": False, "next": "idle"},
+        "hurt":   {"path": "sprites/character_with_bat/TakeDamage.png", "frames": list(range(15)), "fps": 18, "looping": False, "next": "idle"},
+        "die":    {"path": "sprites/character_with_bat/Die.png",        "frames": list(range(15)), "fps": 8,  "looping": False},
+    }
+    post("/sprites/sheets", {
+        "name": "player_bat",
+        "path": "sprites/character_with_bat/Idle.png",
+        "frame_width": 128, "frame_height": 128,
+        "columns": 15, "rows": 8,
+        "animations": bat_anims,
+    })
+
+    shotgun_anims = {
+        "idle":           {"path": "sprites/character_with_shotgun/Idle.png",          "frames": list(range(15)), "fps": 10, "looping": True},
+        "run":            {"path": "sprites/character_with_shotgun/Run.png",           "frames": list(range(15)), "fps": 12, "looping": True},
+        "walk":           {"path": "sprites/character_with_shotgun/Walk.png",          "frames": list(range(15)), "fps": 10, "looping": True},
+        "strafe_left":    {"path": "sprites/character_with_shotgun/StrafeLeft.png",    "frames": list(range(15)), "fps": 12, "looping": True},
+        "strafe_right":   {"path": "sprites/character_with_shotgun/StrafeRight.png",   "frames": list(range(15)), "fps": 12, "looping": True},
+        "run_backwards":  {"path": "sprites/character_with_shotgun/RunBackwards.png",  "frames": list(range(15)), "fps": 12, "looping": True},
+        "attack":       {"path": "sprites/character_with_shotgun/Attack1.png",  "frames": list(range(15)), "fps": 40, "looping": False, "next": "idle"},
+        "attack_melee": {"path": "sprites/character_with_shotgun/Attack2.png",  "frames": list(range(15)), "fps": 22, "looping": False, "next": "idle"},
+        "hurt":   {"path": "sprites/character_with_shotgun/TakeDamage.png", "frames": list(range(15)), "fps": 18, "looping": False, "next": "idle"},
+        "die":    {"path": "sprites/character_with_shotgun/Die.png",        "frames": list(range(15)), "fps": 8,  "looping": False},
+    }
+    post("/sprites/sheets", {
+        "name": "player_shotgun",
+        "path": "sprites/character_with_shotgun/Idle.png",
+        "frame_width": 128, "frame_height": 128,
+        "columns": 15, "rows": 8,
+        "animations": shotgun_anims,
+    })
+
+    # 7c. Register zombie sprite sheets
+    print("   Registering zombie sprite sheets...")
+
+    def zombie_anims(folder, frame_w=128, frame_h=128):
+        """Build animation dict for a zombie sprite folder."""
+        base = f"sprites/all_zombies/{folder}"
+        return {
+            "idle":   {"path": f"{base}/Idle.png",       "frames": list(range(15)), "fps": 10, "looping": True},
+            "run":    {"path": f"{base}/Run.png",        "frames": list(range(15)), "fps": 12, "looping": True},
+            "walk":   {"path": f"{base}/Walk.png",       "frames": list(range(15)), "fps": 10, "looping": True},
+            "attack": {"path": f"{base}/Attack1.png",    "frames": list(range(15)), "fps": 20, "looping": False, "next": "idle"},
+            "hurt":   {"path": f"{base}/TakeDamage.png", "frames": list(range(15)), "fps": 18, "looping": False, "next": "idle"},
+            "die":    {"path": f"{base}/Die.png",        "frames": list(range(15)), "fps": 8,  "looping": False},
+        }
+
+    post("/sprites/sheets", {
+        "name": "zombie_normal",
+        "path": "sprites/all_zombies/ZombieMale1/Idle.png",
+        "frame_width": 128, "frame_height": 128,
+        "columns": 15, "rows": 8,
+        "animations": zombie_anims("ZombieMale1"),
+    })
+    post("/sprites/sheets", {
+        "name": "zombie_runner",
+        "path": "sprites/all_zombies/ZombieCop1/Idle.png",
+        "frame_width": 128, "frame_height": 128,
+        "columns": 15, "rows": 8,
+        "animations": zombie_anims("ZombieCop1"),
+    })
+    post("/sprites/sheets", {
+        "name": "zombie_tank",
+        "path": "sprites/all_zombies/ZombieHulk1/Idle.png",
+        "frame_width": 192, "frame_height": 192,
+        "columns": 15, "rows": 8,
+        "animations": zombie_anims("ZombieHulk1", 192, 192),
+    })
+
+    # 7d. Register decoration sprite sheets (single-frame, idle-only, recentered)
+    print("   Registering decoration sprites...")
+    decoration_sheets = [
+        # Trees (256x512 → recentered + scaled to 128x256)
+        ("tree_a1", f"{gen}/Tree_A1.png", 128, 256),
+        ("tree_a2", f"{gen}/Tree_A2.png", 128, 256),
+        ("tree_a3", f"{gen}/Tree_A3.png", 128, 256),
+        ("tree_a4", f"{gen}/Tree_A4.png", 128, 256),
+        # Cars (256x512 → recentered + scaled to 128x256)
+        ("car_1", f"{gen}/Car1.png", 128, 256),
+        ("car_2", f"{gen}/Car2.png", 128, 256),
+        ("car_3", f"{gen}/Car3.png", 128, 256),
+        # Flora (128x256 → recentered + scaled to 64x128)
+        ("flora_a1", f"{gen}/Flora_A1.png", 64, 128),
+        ("flora_a10", f"{gen}/Flora_A10.png", 64, 128),
+        ("flora_a11", f"{gen}/Flora_A11.png", 64, 128),
+        ("flora_a12", f"{gen}/Flora_A12.png", 64, 128),
+        # Objects (128x256 → recentered + scaled to 64x128)
+        ("object_1", f"{gen}/Object1.png", 64, 128),
+        ("object_2", f"{gen}/Object2.png", 64, 128),
+        ("object_3", f"{gen}/Object3.png", 64, 128),
+        ("object_4", f"{gen}/Object4.png", 64, 128),
+    ]
+    for name, path, fw, fh in decoration_sheets:
+        post("/sprites/sheets", {
+            "name": name,
+            "path": path,
+            "frame_width": fw, "frame_height": fh,
+            "columns": 1, "rows": 1,
+            "animations": {"idle": {"frames": [0], "fps": 1, "looping": True}},
+        })
+
+    # 8. Spawn player
+    print("8. Spawning player...")
+    player_def = {
+        "x": spawn_x,
+        "y": spawn_y,
+        "is_player": True,
+        "tags": ["player"],
+        "components": [
+            {"type": "collider", "width": 36, "height": 44},
+            {"type": "top_down_mover", "speed": 170},
+            {"type": "health", "current": 10, "max": 10},
+            {"type": "animation_controller", "graph": "player_bat",
+             "auto_from_velocity": False, "facing_direction": 5},
+            {"type": "hitbox", "width": 30, "height": 30, "offset_x": 0, "offset_y": 0,
+             "active": False, "damage": 2, "damage_tag": "enemy"},
+        ],
+    }
+    player_def["script"] = "player_combat"
+    player = post("/entities", player_def)
+    player_id = player["data"]["id"]
+    print(f"   Player id={player_id}")
+
+    # 9. Camera
+    print("9. Setting up camera...")
+    # Isometric world bounds — the diamond-shaped map extends in all directions
+    corner_tl = iso_grid_to_world(0, 0)
+    corner_tr = iso_grid_to_world(MAP_W - 1, 0)
+    corner_bl = iso_grid_to_world(0, MAP_H - 1)
+    corner_br = iso_grid_to_world(MAP_W - 1, MAP_H - 1)
+    world_min_x = min(corner_tl[0], corner_bl[0])
+    world_max_x = max(corner_tr[0], corner_br[0])
+    world_min_y = min(corner_tl[1], corner_tr[1])
+    world_max_y = max(corner_bl[1], corner_br[1])
+    post("/camera/config", {
+        "zoom": 2.0,
+        "follow_speed": 5.0,
+        "follow_target": player_id,
+        "deadzone": [0, 0],
+        "bounds": {
+            "min_x": world_min_x,
+            "min_y": world_min_y,
+            "max_x": world_max_x,
+            "max_y": world_max_y,
+        },
+    })
+
+    # 10. Spawn ambient zombies
+    if TILE_TEST_MODE:
+        print("10. Skipping zombies (tile test mode)...")
+        zombie_spawns = []
+    else:
+        print("10. Spawning ambient zombies...")
+        zombie_spawns = find_zombie_spawns(tiles, MAP_W, MAP_H, [spawn_x, spawn_y], 25, rng, min_dist=600)
+    zombie_count = 0
+    for zx, zy in zombie_spawns:
+        # Determine variant by proximity to zones
+        variant = "normal"
+        zone_name = "wilderness"
+        for zone in ZONES:
+            zcx, zcy = iso_grid_to_world(zone["cx"], zone["cy"])
+            dist = math.sqrt((zx - zcx) ** 2 + (zy - zcy) ** 2)
+            if dist < zone["radius"] * ISO_TILE_W / 4:
+                zone_name = zone["name"]
+                break
+
+        if zone_name == "military":
+            variant = rng.choice(["tank", "tank", "normal", "runner"])
+        elif zone_name == "industrial":
+            variant = rng.choice(["normal", "normal", "runner"])
+        elif zone_name == "town":
+            variant = rng.choice(["normal", "normal", "normal", "runner"])
+        else:
+            variant = "normal"
+
+        hp = {"normal": 3, "runner": 1, "tank": 8}[variant]
+        speed = {"normal": 90, "runner": 160, "tank": 55}[variant]
+        coll_w = {"normal": 34, "runner": 28, "tank": 44}[variant]
+        coll_h = {"normal": 42, "runner": 36, "tank": 52}[variant]
+        dmg = {"normal": 1, "runner": 1, "tank": 2}[variant]
+        tags = ["enemy", "zombie", f"zombie_{variant}"]
+
+        post("/entities", {
+            "x": zx, "y": zy,
+            "is_player": False,
+            "tags": tags,
+            "script": "zombie_ai",
+            "components": [
+                {"type": "collider", "width": coll_w, "height": coll_h},
+                {"type": "top_down_mover", "speed": speed},
+                {"type": "health", "current": hp, "max": hp},
+                {"type": "hitbox", "width": coll_w + 10, "height": coll_h + 10, "offset_x": 0, "offset_y": 0, "active": False, "damage": dmg, "damage_tag": "player"},
+                {"type": "animation_controller", "graph": f"zombie_{variant}", "auto_from_velocity": True},
+            ],
+        })
+        zombie_count += 1
+    print(f"   Spawned {zombie_count} ambient zombies")
+
+    # 11. Spawn loot
+    if TILE_TEST_MODE:
+        print("11. Skipping loot (tile test mode)...")
+        loot_spots = []
+    else:
+        print("11. Placing loot...")
+        loot_spots = find_loot_spawns(tiles, MAP_W, MAP_H, rng, count=70)
+    loot_counts = {"health": 0, "ammo": 0, "weapon": 0}
+    for i, (lx, ly) in enumerate(loot_spots):
+        # Determine loot type based on zone proximity and random
+        zone_name = "wilderness"
+        for zone in ZONES:
+            zcx, zcy = iso_grid_to_world(zone["cx"], zone["cy"])
+            dist = math.sqrt((lx - zcx) ** 2 + (ly - zcy) ** 2)
+            if dist < zone["radius"] * ISO_TILE_W / 4:
+                zone_name = zone["name"]
+                break
+
+        roll = rng.random()
+        if zone_name == "military":
+            # Military: heavy on weapons and ammo
+            if roll < 0.45:
+                tags = ["pickup", "ammo_pickup"]
+                loot_counts["ammo"] += 1
+            elif roll < 0.8:
+                tags = ["pickup", "weapon_pickup"]
+                loot_counts["weapon"] += 1
+            else:
+                tags = ["pickup", "health_pickup"]
+                loot_counts["health"] += 1
+        elif zone_name == "industrial":
+            # Industrial: ammo, some weapons
+            if roll < 0.45:
+                tags = ["pickup", "ammo_pickup"]
+                loot_counts["ammo"] += 1
+            elif roll < 0.6:
+                tags = ["pickup", "weapon_pickup"]
+                loot_counts["weapon"] += 1
+            else:
+                tags = ["pickup", "health_pickup"]
+                loot_counts["health"] += 1
+        elif zone_name == "farm":
+            # Farm: mostly health, rare ammo
+            if roll < 0.15:
+                tags = ["pickup", "ammo_pickup"]
+                loot_counts["ammo"] += 1
+            else:
+                tags = ["pickup", "health_pickup"]
+                loot_counts["health"] += 1
+        else:
+            # Town/residential/wilderness: balanced
+            if roll < 0.25:
+                tags = ["pickup", "ammo_pickup"]
+                loot_counts["ammo"] += 1
+            elif roll < 0.4:
+                tags = ["pickup", "weapon_pickup"]
+                loot_counts["weapon"] += 1
+            else:
+                tags = ["pickup", "health_pickup"]
+                loot_counts["health"] += 1
+
+        post("/entities", {
+            "x": lx, "y": ly,
+            "is_player": False,
+            "tags": tags,
+            "components": [
+                {"type": "collider", "width": 14, "height": 14},
+            ],
+        })
+    print(f"   Placed {sum(loot_counts.values())} pickups: {loot_counts['health']} health, {loot_counts['ammo']} ammo, {loot_counts['weapon']} weapon")
+
+    # 11b. Spawn decoration entities
+    print("   Spawning decorations...")
+    tree_variants = ["tree_a1", "tree_a2", "tree_a3", "tree_a4"]
+    car_variants = ["car_1", "car_2", "car_3"]
+    flora_variants = ["flora_a1", "flora_a10", "flora_a11", "flora_a12"]
+    object_variants = ["object_1", "object_2", "object_3", "object_4"]
+    deco_count = 0
+
+    # Trees — large collidable decorations that block movement
+    for wx, wy in decorations["trees"]:
+        variant = rng.choice(tree_variants)
+        post("/entities", {
+            "x": wx, "y": wy,
+            "is_player": False,
+            "tags": ["decoration", "tree"],
+            "components": [
+                {"type": "collider", "width": 20, "height": 20},
+                {"type": "animation_controller", "graph": variant, "auto_from_velocity": False},
+            ],
+        })
+        deco_count += 1
+
+    # Cars — large collidable decorations along roads
+    for wx, wy in decorations["cars"]:
+        variant = rng.choice(car_variants)
+        post("/entities", {
+            "x": wx, "y": wy,
+            "is_player": False,
+            "tags": ["decoration", "car"],
+            "components": [
+                {"type": "collider", "width": 40, "height": 24},
+                {"type": "animation_controller", "graph": variant, "auto_from_velocity": False},
+            ],
+        })
+        deco_count += 1
+
+    # Flora — small non-collidable decorations on grass
+    for wx, wy in decorations["flora"]:
+        variant = rng.choice(flora_variants)
+        post("/entities", {
+            "x": wx, "y": wy,
+            "is_player": False,
+            "tags": ["decoration", "flora"],
+            "components": [
+                {"type": "animation_controller", "graph": variant, "auto_from_velocity": False},
+            ],
+        })
+        deco_count += 1
+
+    # Objects — small collidable decorations inside buildings
+    for wx, wy in decorations["objects"]:
+        variant = rng.choice(object_variants)
+        post("/entities", {
+            "x": wx, "y": wy,
+            "is_player": False,
+            "tags": ["decoration", "object"],
+            "components": [
+                {"type": "collider", "width": 14, "height": 14},
+                {"type": "animation_controller", "graph": variant, "auto_from_velocity": False},
+            ],
+        })
+        deco_count += 1
+
+    print(f"   Spawned {deco_count} decoration entities")
+
+    # 12. Set game variables
+    print("12. Setting game variables...")
+    # Zone info as flat variables for Lua (can't pass tables)
+    zone_vars = {
+        "score": 0,
+        "zombies_killed": 0,
+        "game_over": False,
+        "player_x": spawn_x,
+        "player_y": spawn_y,
+        "spawn_x": spawn_x,
+        "spawn_y": spawn_y,
+        "death_timer": 0,
+        "tile_size": TILE_SIZE,
+        "iso_tile_w": ISO_TILE_W,
+        "iso_tile_h": ISO_TILE_H,
+        "map_width": MAP_W,
+        "map_height": MAP_H,
+        "survival_time": 0,
+        "max_zombies": 30,
+        "zombie_respawn_timer": 0,
+        "alive_zombie_count": zombie_count,
+        "stamina": 100,
+        "sprinting": False,
+        "weapon_level": 0,
+        "ammo": 0,
+        "attack_damage": 2,
+        "attack_range": 30,
+        "attack_speed": 20,
+        "player_needs_reset": False,
+    }
+    # Zone data (flattened for Lua)
+    for i, zone in enumerate(ZONES):
+        zone_vars[f"zone_{i}_name"] = zone["name"]
+        zcx, zcy = iso_grid_to_world(zone["cx"], zone["cy"])
+        zone_vars[f"zone_{i}_cx"] = zcx
+        zone_vars[f"zone_{i}_cy"] = zcy
+        zone_vars[f"zone_{i}_radius"] = zone["radius"] * ISO_TILE_W / 4
+        zone_vars[f"zone_{i}_density"] = zone["density"]
+    zone_vars["zone_count"] = len(ZONES)
+
+    post("/scripts/vars", zone_vars)
+
+    # 13. Start game
+    print("13. Starting game...")
+    post("/game/state", {"state": "Playing"})
+
+    # 14. Report
+    entities = get("/entities").get("data") or []
+    zombies = [e for e in entities if "zombie" in e.get("tags", [])]
+    pickups = [e for e in entities if "pickup" in e.get("tags", [])]
+    print(f"\n   Total entities: {len(entities)}")
+    print(f"   Zombies: {len(zombies)}")
+    print(f"   Pickups: {len(pickups)}")
+
+    errors = get("/scripts/errors").get("data") or []
+    if errors:
+        print(f"\n   Script errors ({len(errors)}):")
+        for err in errors[:5]:
+            print(f"     - {err}")
+
+    # 15. Capture screenshots for visual verification
+    print("\n--- Step 15: Capturing screenshots ---")
+    time.sleep(3)  # Wait for game to render
+    for i in range(3):
+        try:
+            resp = get("/screenshot")
+            path = resp.get("data", "")
+            print(f"  Screenshot {i+1}: {path}")
+        except Exception as e:
+            print(f"  Screenshot {i+1}: failed ({e})")
+        time.sleep(2)
+
+    print("\n=== Zombie Survival built successfully ===")
+    print(f"World: {MAP_W}x{MAP_H} grid (isometric {ISO_TILE_W}x{ISO_TILE_H})")
+    print("Open windowed: cd axiom && cargo run")
+    print("\nControls: Arrow keys = move, Shift = sprint, Z/X/Enter or Left Click = attack")
+    return 0
+
+
+def main():
+    client = AxiomClient(timeout=60.0)
+    print("Connecting to Axiom engine...")
+    if not client.wait_for_server(timeout=5.0):
+        print("ERROR: Engine not running. Start it first:")
+        print("  cd C:\\Users\\cobra\\axiom && cargo run")
+        return 1
+    print("Connected!\n")
+    return build_game(client)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

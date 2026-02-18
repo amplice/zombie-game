@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+screenshots/
+feedback_screenshots/
+assets/
