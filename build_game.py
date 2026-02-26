@@ -12,6 +12,9 @@ Then build the game:
 """
 
 import sys
+import os
+import re
+import json
 import random
 import math
 import time
@@ -30,6 +33,180 @@ MAP_W, MAP_H = (40, 40) if TILE_TEST_MODE else (200, 140)
 # ── Isometric tile dimensions ────────────────────────────────────────
 ISO_TILE_W = 128   # Diamond base width (pixels)
 ISO_TILE_H = 64    # Diamond base height (pixels)
+
+USE_PRIMITIVE_RUNTIME_PROFILE = True
+PRIMITIVE_TEACHER_DIR = Path(
+    os.environ.get(
+        "ZOMBIE_PRIMITIVE_TEACHER_DIR",
+        r"C:\Users\cobra\axiom\artifacts\ground_autotile\primitive_teacher",
+    )
+)
+# Legacy single-profile path (still works if pointed at old location)
+PRIMITIVE_RUNTIME_PROFILE_JSON = Path(
+    os.environ.get(
+        "ZOMBIE_GRASS_PRIMITIVE_RUNTIME_JSON",
+        str(PRIMITIVE_TEACHER_DIR / "grass_G" / "border_primitives_runtime.json"),
+    )
+)
+
+# ── Material registration ──────────────────────────────────────────
+# Each entry: (series_letter, family_count, label, minimap_color)
+MATERIAL_FAMILIES = [
+    ("A", 16, "dirt_water", [0.30, 0.25, 0.18]),
+    ("G", 10, "grass", [0.35, 0.52, 0.28]),
+    # Uncomment after teaching with the primitive teacher:
+    # ("B", 14, "brown_earth", [0.42, 0.33, 0.22]),
+    # ("C", 4, "stone", [0.55, 0.53, 0.50]),
+    # ("F", 5, "dark_earth", [0.25, 0.22, 0.18]),
+]
+
+# Runtime profiles to load (series -> subdir). Profiles that don't exist are skipped.
+MATERIAL_PROFILES = {
+    "G": "grass_G",
+    "A": "dirt_water_A",
+    # "B": "brown_earth_B",
+    # "C": "stone_C",
+}
+
+# Easy local debug toggles (preferred over env vars during tile-mapping iteration)
+# Set to one of: "off", "edge", "outside_corner", "inside_corner", "all"
+PRIMITIVE_DEBUG_MODE = "off"
+
+# Optional env overrides (still supported for scripted runs)
+_env_primitive_debug_mode = os.environ.get("ZOMBIE_PRIMITIVE_DEBUG_MODE", "").strip().lower()
+_env_rect_debug = os.environ.get("ZOMBIE_RECTANGLE_EDGE_DEBUG_TEST", "").strip()
+_env_primitive_step = os.environ.get("ZOMBIE_PRIMITIVE_DEBUG_STEP", "").strip().lower()
+
+if _env_primitive_debug_mode:
+    _primitive_debug_mode = _env_primitive_debug_mode
+elif _env_rect_debug == "1":
+    # Back-compat path for older env flags
+    _primitive_debug_mode = _env_primitive_step or "all"
+else:
+    _primitive_debug_mode = (PRIMITIVE_DEBUG_MODE or "off").strip().lower()
+
+if _primitive_debug_mode not in {"off", "edge", "outside_corner", "inside_corner", "all"}:
+    _primitive_debug_mode = "off"
+
+RECTANGLE_EDGE_DEBUG_TEST = _primitive_debug_mode != "off"
+PRIMITIVE_DEBUG_STEP = "" if _primitive_debug_mode in {"off", "all"} else _primitive_debug_mode
+
+
+def _tile_key_to_name(tile_key):
+    """Convert tile key like G4_S into source asset basename Ground G4_S.png (without .png)."""
+    m = re.match(r"^([A-Z])(\d+)_([NESW])$", str(tile_key))
+    if not m:
+        return None
+    series, idx, d = m.group(1), int(m.group(2)), m.group(3)
+    return f"Ground {series}{idx}_{d}"
+
+
+def _parse_tile_key(tile_key):
+    m = re.match(r"^([A-Z])(\d+)_([NESW])$", str(tile_key))
+    if not m:
+        return None
+    return (m.group(1), int(m.group(2)), m.group(3))
+
+
+def mask8_at(is_grass, width, height, x, y):
+    def at(xx, yy):
+        if xx < 0 or yy < 0 or xx >= width or yy >= height:
+            return False
+        return bool(is_grass[yy * width + xx])
+    m = 0
+    if at(x, y - 1): m |= 1
+    if at(x + 1, y - 1): m |= 2
+    if at(x + 1, y): m |= 4
+    if at(x + 1, y + 1): m |= 8
+    if at(x, y + 1): m |= 16
+    if at(x - 1, y + 1): m |= 32
+    if at(x - 1, y): m |= 64
+    if at(x - 1, y - 1): m |= 128
+    return m
+
+
+def classify_border_primitive(mask8):
+    """Grid-frame primitive classification aligned with the primitive teacher runtime export."""
+    m = int(mask8) & 0xFF
+    n = 1 if (m & 1) else 0
+    ne = 1 if (m & 2) else 0
+    e = 1 if (m & 4) else 0
+    se = 1 if (m & 8) else 0
+    s = 1 if (m & 16) else 0
+    sw = 1 if (m & 32) else 0
+    w = 1 if (m & 64) else 0
+    nw = 1 if (m & 128) else 0
+    orth = {"N": n, "E": e, "S": s, "W": w}
+    orth_count = n + e + s + w
+    if orth_count == 4:
+        missing = []
+        if not ne: missing.append("NE")
+        if not se: missing.append("SE")
+        if not sw: missing.append("SW")
+        if not nw: missing.append("NW")
+        if len(missing) == 0:
+            return None
+        if len(missing) == 1:
+            return ("inside_corner", missing[0])
+        return ("degenerate", "default")
+    if orth_count == 3:
+        for side in ("N", "E", "S", "W"):
+            if not orth[side]:
+                return ("edge", side)
+    if orth_count == 2:
+        if n and e: return ("outside_corner", "SW")
+        if e and s: return ("outside_corner", "NW")
+        if s and w: return ("outside_corner", "NE")
+        if w and n: return ("outside_corner", "SE")
+        return ("degenerate", "default")
+    return ("degenerate", "default")
+
+
+def load_primitive_runtime_profile(path, tile_ids):
+    """Load a border primitive runtime profile (v2 or v3 format)."""
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"   Failed to read primitive runtime profile: {exc}")
+        return None
+    fmt = str(payload.get("format", ""))
+    if fmt not in ("zombie_game_grass_border_primitives_runtime", "axiom_border_primitives_runtime"):
+        print(f"   Primitive runtime profile has unexpected format '{fmt}'; ignoring")
+        return None
+    slots = (payload.get("compiled_grid_frame_slots") or {})
+    out = {
+        "fill": int(tile_ids.get(str(slots.get("fill", "")), 0)),
+        "fallback": int(tile_ids.get(str(slots.get("fallback", "")), 0)),
+        "edge": {},
+        "outside_corner": {},
+        "inside_corner": {},
+        "degenerate": {"default": 0},
+    }
+    for orient in ("N", "E", "S", "W"):
+        tk = str(((slots.get("edge") or {}).get(orient)) or "")
+        out["edge"][orient] = int(tile_ids.get(tk, 0))
+    for orient in ("NE", "SE", "SW", "NW"):
+        tk_o = str(((slots.get("outside_corner") or {}).get(orient)) or "")
+        tk_i = str(((slots.get("inside_corner") or {}).get(orient)) or "")
+        out["outside_corner"][orient] = int(tile_ids.get(tk_o, 0))
+        out["inside_corner"][orient] = int(tile_ids.get(tk_i, 0))
+    tk_d = str((((slots.get("degenerate") or {}).get("default")) or ""))
+    out["degenerate"]["default"] = int(tile_ids.get(tk_d, 0))
+    if not out["fill"]:
+        print("   Primitive runtime profile did not map to current tile IDs; ignoring")
+        return None
+    inv_tile_ids = {v: k for k, v in tile_ids.items()}
+    edge_dbg = ", ".join(
+        f"{o}->{inv_tile_ids.get(out['edge'].get(o, 0), '?')}"
+        for o in ("N", "E", "S", "W")
+    )
+    mat = payload.get("material") or {}
+    label = mat.get("label", "?")
+    print(f"   Using {label} primitive runtime profile from: {path}")
+    print(f"   Primitive edge slots (grid): {edge_dbg}")
+    return out
 
 
 def iso_grid_to_world(col, row):
@@ -50,123 +227,335 @@ def load_script(client, name, path, global_script=False):
 
 # ── World Generation ────────────────────────────────────────────────
 
-def generate_world(width, height, seed=42):
-    """Generate terrain using A1 (dirt) and G1-G10 (grass variants).
+def apply_material_profile(tiles, is_material, width, height, profile_ids, fallback_fill,
+                           tile_ids=None, primitive_pick_counts=None, primitive_kind_counts=None,
+                           debug_step=""):
+    """Classify borders and assign tile IDs for one material layer.
 
-    Tile IDs:
-      0  = empty
-      1  = A1  (full dirt)
-      2  = G1  (full grass)
-      3  = G2  (dirt edge N)
-      4  = G3  (dirt edge E)
-      5  = G4  (dirt edge S)
-      6  = G5  (dirt edge W)
-      7  = G6  (dirt corner NE)
-      8  = G7  (dirt corner SE)
-      9  = G8  (dirt corner SW)
-      10 = G9  (dirt corner NW)
-      11 = G10 (sparse grass / mostly dirt)
+    For each cell where is_material[cell] is True, compute the 8-neighbor mask
+    against the is_material boolean array, classify the border primitive, and
+    write the appropriate tile ID from profile_ids into tiles[].
+
+    Non-material cells are left untouched.
+    """
+    if primitive_pick_counts is None:
+        primitive_pick_counts = {}
+    if primitive_kind_counts is None:
+        primitive_kind_counts = {}
+
+    fill_id = profile_ids.get("fill", fallback_fill) or fallback_fill
+
+    for y in range(height):
+        for x in range(width):
+            i = y * width + x
+            if not is_material[i]:
+                continue
+            m8 = mask8_at(is_material, width, height, x, y)
+            cls = classify_border_primitive(m8)
+            if cls is None:
+                tiles[i] = fill_id
+                continue
+            kind, orient = cls
+            if debug_step and kind != debug_step:
+                tiles[i] = fill_id
+                continue
+            if kind == "edge":
+                tile_id = int(((profile_ids.get("edge") or {}).get(orient)) or 0)
+            elif kind == "outside_corner":
+                tile_id = int(((profile_ids.get("outside_corner") or {}).get(orient)) or 0)
+            elif kind == "inside_corner":
+                tile_id = int(((profile_ids.get("inside_corner") or {}).get(orient)) or 0)
+            else:
+                tile_id = int((((profile_ids.get("degenerate") or {}).get("default")) or 0))
+            if not tile_id:
+                tile_id = int(profile_ids.get("fallback", 0) or fill_id)
+            tiles[i] = tile_id
+            primitive_kind_counts[kind] = primitive_kind_counts.get(kind, 0) + 1
+            primitive_pick_counts[(kind, orient, tile_id)] = primitive_pick_counts.get((kind, orient, tile_id), 0) + 1
+
+    return primitive_pick_counts, primitive_kind_counts
+
+
+def generate_world(width, height, seed=42, tile_ids=None, grass_primitive_profile_ids=None, material_profiles=None):
+    """Generate terrain with three materials: grass, water, and dirt.
+
+    material_profiles: dict of series -> profile_ids (from load_primitive_runtime_profile).
+    grass_primitive_profile_ids: legacy param, equivalent to material_profiles["G"].
+
+    Grass and water are never adjacent — a 2-cell dirt buffer always separates them.
     """
     rng = random.Random(seed)
-    T_DIRT = 8          # A1
-    T_GRASS = 9         # G1 full grass
-    T_EDGE_N = 10       # G2
-    T_EDGE_E = 11       # G3
-    T_EDGE_S = 12       # G4
-    T_EDGE_W = 13       # G5
-    T_CORNER_NE = 14    # G6
-    T_CORNER_SE = 15    # G7
-    T_CORNER_SW = 16    # G8
-    T_CORNER_NW = 17    # G9
-    T_SPARSE = 18       # G10
+
+    # Merge legacy param into material_profiles
+    if material_profiles is None:
+        material_profiles = {}
+    if grass_primitive_profile_ids and "G" not in material_profiles:
+        material_profiles["G"] = grass_primitive_profile_ids
+
+    def tid(key, default=0):
+        if isinstance(tile_ids, dict):
+            return int(tile_ids.get(key, default))
+        return int(default)
+
+    # Fallback fixed IDs for legacy mode (when tile_ids is None).
+    T_DIRT = tid("A1_S", 8)
+    T_GRASS = tid("G1_S", 9)
+    T_EDGE_N = tid("G2_N", 10)
+    T_EDGE_E = tid("G3_E", 11)
+    T_EDGE_S = tid("G4_S", 12)
+    T_EDGE_W = tid("G5_W", 13)
+    T_CORNER_NE = tid("G6_N", 14)
+    T_CORNER_SE = tid("G7_E", 15)
+    T_CORNER_SW = tid("G8_S", 16)
+    T_CORNER_NW = tid("G9_W", 17)
+    T_SPARSE = tid("G10_S", 18)
 
     def idx(tx, ty):
         return ty * width + tx
 
-    # Step 1: Generate a grass/dirt base map using overlapping blobs
-    # Start with all dirt, add grass patches
-    is_grass = [False] * (width * height)
+    use_profiles = bool(material_profiles.get("G"))
 
-    # Several grass blobs of varying size for organic terrain
-    blobs = []
-    for _ in range(12):
-        cx = rng.randint(3, width - 4)
-        cy = rng.randint(3, height - 4)
-        rx = rng.randint(4, 12)
-        ry = rng.randint(4, 12)
-        blobs.append((cx, cy, rx, ry))
+    # ── Step 1: Grass blobs ──────────────────────────────────────────
+    # material_map: "G" = grass, "A" = water, "D" = dirt
+    material_map = ["D"] * (width * height)
 
-    for y in range(height):
-        for x in range(width):
-            for cx, cy, rx, ry in blobs:
-                # Elliptical distance with slight noise for organic edges
-                dx = (x - cx) / rx
-                dy = (y - cy) / ry
-                dist = dx * dx + dy * dy
-                # Add jitter to edges
-                jitter = rng.random() * 0.3
-                if dist < 1.0 + jitter:
-                    is_grass[idx(x, y)] = True
+    if RECTANGLE_EDGE_DEBUG_TEST:
+        x1 = max(3, width // 2 - 8)
+        x2 = min(width - 4, width // 2 + 8)
+        y1 = max(3, height // 2 - 6)
+        y2 = min(height - 4, height // 2 + 6)
+        for y in range(y1, y2 + 1):
+            for x in range(x1, x2 + 1):
+                material_map[idx(x, y)] = "G"
+        print(f"   Rectangle edge debug test: grass rect=({x1},{y1})..({x2},{y2})")
+    else:
+        # Several grass blobs of varying size for organic terrain
+        grass_blobs = []
+        for _ in range(12):
+            cx = rng.randint(3, width - 4)
+            cy = rng.randint(3, height - 4)
+            rx = rng.randint(4, 12)
+            ry = rng.randint(4, 12)
+            grass_blobs.append((cx, cy, rx, ry))
+
+        for y in range(height):
+            for x in range(width):
+                for cx, cy, rx, ry in grass_blobs:
+                    dx = (x - cx) / rx
+                    dy = (y - cy) / ry
+                    dist = dx * dx + dy * dy
+                    jitter = rng.random() * 0.3
+                    if dist < 1.0 + jitter:
+                        material_map[idx(x, y)] = "G"
+                        break
+
+    # ── Step 1b: Remove thin grass strips ────────────────────────────
+    def mat_at(tx, ty):
+        if tx < 0 or ty < 0 or tx >= width or ty >= height:
+            return "D"
+        return material_map[idx(tx, ty)]
+
+    changed = True
+    while changed:
+        changed = False
+        for y in range(height):
+            for x in range(width):
+                if material_map[idx(x, y)] != "G":
+                    continue
+                n = mat_at(x, y - 1) == "G"
+                s = mat_at(x, y + 1) == "G"
+                e = mat_at(x + 1, y) == "G"
+                w = mat_at(x - 1, y) == "G"
+                if not (n or s) or not (e or w):
+                    material_map[idx(x, y)] = "D"
+                    changed = True
+
+    # ── Step 1c: Water blobs (with 2-cell grass buffer) ──────────────
+    if not RECTANGLE_EDGE_DEBUG_TEST:
+        # Build buffer mask: cells within 2 tiles of any grass cell are off-limits for water
+        grass_buffer = [False] * (width * height)
+        for y in range(height):
+            for x in range(width):
+                if material_map[idx(x, y)] == "G":
+                    for dy in range(-2, 3):
+                        for dx in range(-2, 3):
+                            nx, ny = x + dx, y + dy
+                            if 0 <= nx < width and 0 <= ny < height:
+                                grass_buffer[idx(nx, ny)] = True
+
+        # Place ~4 smaller water blobs only where dirt AND outside buffer.
+        # Find valid candidate cells (non-buffered dirt) for blob centers so
+        # water actually appears even on small maps.
+        valid_centers = []
+        for y in range(4, height - 4):
+            for x in range(4, width - 4):
+                if not grass_buffer[idx(x, y)] and material_map[idx(x, y)] == "D":
+                    valid_centers.append((x, y))
+        rng.shuffle(valid_centers)
+
+        water_blobs = []
+        blob_target = min(4, len(valid_centers))
+        # Space blob centers apart (min 6 cells) to get distinct ponds
+        chosen = []
+        for cx, cy in valid_centers:
+            too_close = False
+            for ox, oy in chosen:
+                if abs(cx - ox) + abs(cy - oy) < 6:
+                    too_close = True
+                    break
+            if not too_close:
+                chosen.append((cx, cy))
+                rx = rng.randint(3, 7)
+                ry = rng.randint(3, 7)
+                water_blobs.append((cx, cy, rx, ry))
+                if len(water_blobs) >= blob_target:
                     break
 
-    # Step 2: Assign tile IDs based on grass/dirt and neighbor analysis
+        for y in range(height):
+            for x in range(width):
+                i = idx(x, y)
+                if material_map[i] != "D" or grass_buffer[i]:
+                    continue
+                for cx, cy, rx, ry in water_blobs:
+                    dx = (x - cx) / rx
+                    dy = (y - cy) / ry
+                    dist = dx * dx + dy * dy
+                    jitter = rng.random() * 0.3
+                    if dist < 1.0 + jitter:
+                        material_map[i] = "A"
+                        break
+
+        # Remove thin water strips (same logic as grass)
+        changed = True
+        while changed:
+            changed = False
+            for y in range(height):
+                for x in range(width):
+                    if material_map[idx(x, y)] != "A":
+                        continue
+                    n = mat_at(x, y - 1) == "A"
+                    s = mat_at(x, y + 1) == "A"
+                    e = mat_at(x + 1, y) == "A"
+                    w = mat_at(x - 1, y) == "A"
+                    if not (n or s) or not (e or w):
+                        material_map[idx(x, y)] = "D"
+                        changed = True
+
+    # ── Step 2: Derive boolean masks ─────────────────────────────────
+    is_grass = [m == "G" for m in material_map]
+    is_water = [m == "A" for m in material_map]
+
+    # Debug: material cell counts
+    n_grass = sum(is_grass)
+    n_water = sum(is_water)
+    n_dirt = width * height - n_grass - n_water
+    print(f"   Material cells: grass={n_grass}, water={n_water}, dirt={n_dirt}")
+
+    # ── Step 3: Assign tile IDs ──────────────────────────────────────
     tiles = [0] * (width * height)
 
-    def grass_at(tx, ty):
-        if tx < 0 or ty < 0 or tx >= width or ty >= height:
-            return False
-        return is_grass[idx(tx, ty)]
+    primitive_pick_counts = {}
+    primitive_kind_counts = {}
 
-    for y in range(height):
-        for x in range(width):
-            if not is_grass[idx(x, y)]:
-                # This is a dirt tile. Check if any neighbor is grass
-                # to maybe use sparse grass (G10) as a soft transition
-                grass_neighbors = sum([
-                    grass_at(x, y-1), grass_at(x, y+1),
-                    grass_at(x-1, y), grass_at(x+1, y),
-                ])
-                if grass_neighbors >= 1 and rng.random() < 0.3:
-                    tiles[idx(x, y)] = T_SPARSE  # scattered grass near edges
+    grass_profile = material_profiles.get("G")
+    water_profile = material_profiles.get("A")
+
+    if use_profiles:
+        # Fill all dirt first
+        for i in range(width * height):
+            tiles[i] = T_DIRT
+
+        # Apply grass profile
+        if grass_profile:
+            apply_material_profile(
+                tiles, is_grass, width, height, grass_profile, T_GRASS,
+                tile_ids=tile_ids,
+                primitive_pick_counts=primitive_pick_counts,
+                primitive_kind_counts=primitive_kind_counts,
+                debug_step=PRIMITIVE_DEBUG_STEP,
+            )
+
+        # Apply water profile
+        if water_profile:
+            water_pick_counts = {}
+            water_kind_counts = {}
+            water_fill = water_profile.get("fill", T_DIRT) or T_DIRT
+            apply_material_profile(
+                tiles, is_water, width, height, water_profile, water_fill,
+                tile_ids=tile_ids,
+                primitive_pick_counts=water_pick_counts,
+                primitive_kind_counts=water_kind_counts,
+                debug_step=PRIMITIVE_DEBUG_STEP,
+            )
+            # Merge water stats into main counters for reporting
+            for k, v in water_kind_counts.items():
+                primitive_kind_counts[k] = primitive_kind_counts.get(k, 0) + v
+            for k, v in water_pick_counts.items():
+                primitive_pick_counts[k] = primitive_pick_counts.get(k, 0) + v
+    else:
+        # Legacy mask-based path (no profiles loaded)
+        def grass_at(tx, ty):
+            if tx < 0 or ty < 0 or tx >= width or ty >= height:
+                return False
+            return is_grass[idx(tx, ty)]
+
+        for y in range(height):
+            for x in range(width):
+                if not is_grass[idx(x, y)]:
+                    grass_neighbors = sum([
+                        grass_at(x, y-1), grass_at(x, y+1),
+                        grass_at(x-1, y), grass_at(x+1, y),
+                    ])
+                    if grass_neighbors >= 1 and rng.random() < 0.3:
+                        tiles[idx(x, y)] = T_SPARSE
+                    else:
+                        tiles[idx(x, y)] = T_DIRT
+                    continue
+
+                n = not grass_at(x, y - 1)
+                s = not grass_at(x, y + 1)
+                e = not grass_at(x + 1, y)
+                w = not grass_at(x - 1, y)
+
+                if not n and not s and not e and not w:
+                    tiles[idx(x, y)] = T_GRASS
+                elif n and not s and not e and not w:
+                    tiles[idx(x, y)] = T_EDGE_N
+                elif not n and not s and e and not w:
+                    tiles[idx(x, y)] = T_EDGE_E
+                elif not n and s and not e and not w:
+                    tiles[idx(x, y)] = T_EDGE_S
+                elif not n and not s and not e and w:
+                    tiles[idx(x, y)] = T_EDGE_W
+                elif n and e:
+                    tiles[idx(x, y)] = T_CORNER_NE
+                elif s and e:
+                    tiles[idx(x, y)] = T_CORNER_SE
+                elif s and w:
+                    tiles[idx(x, y)] = T_CORNER_SW
+                elif n and w:
+                    tiles[idx(x, y)] = T_CORNER_NW
                 else:
-                    tiles[idx(x, y)] = T_DIRT
-                continue
+                    tiles[idx(x, y)] = T_SPARSE
 
-            # This is a grass tile — check which neighbors are dirt
-            n = not grass_at(x, y - 1)  # dirt to north?
-            s = not grass_at(x, y + 1)  # dirt to south?
-            e = not grass_at(x + 1, y)  # dirt to east?
-            w = not grass_at(x - 1, y)  # dirt to west?
-
-            if not n and not s and not e and not w:
-                tiles[idx(x, y)] = T_GRASS  # G1: fully surrounded by grass
-            # Single edges
-            elif n and not s and not e and not w:
-                tiles[idx(x, y)] = T_EDGE_N
-            elif not n and not s and e and not w:
-                tiles[idx(x, y)] = T_EDGE_E
-            elif not n and s and not e and not w:
-                tiles[idx(x, y)] = T_EDGE_S
-            elif not n and not s and not e and w:
-                tiles[idx(x, y)] = T_EDGE_W
-            # Corners (two adjacent dirt edges)
-            elif n and e:
-                tiles[idx(x, y)] = T_CORNER_NE
-            elif s and e:
-                tiles[idx(x, y)] = T_CORNER_SE
-            elif s and w:
-                tiles[idx(x, y)] = T_CORNER_SW
-            elif n and w:
-                tiles[idx(x, y)] = T_CORNER_NW
-            else:
-                # Narrow strip or isolated — use sparse
-                tiles[idx(x, y)] = T_SPARSE
+    if primitive_kind_counts:
+        print("   Primitive placement counts:", ", ".join(f"{k}:{v}" for k, v in sorted(primitive_kind_counts.items(), key=lambda kv: (-kv[1], kv[0]))))
+    if primitive_pick_counts:
+        top = sorted(primitive_pick_counts.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1], kv[0][2]))[:12]
+        inv_tile_ids = {v: k for k, v in (tile_ids or {}).items()} if tile_ids else {}
+        print(
+            "   Primitive tile picks (top): " +
+            ", ".join(
+                f"{k}/{o}->{inv_tile_ids.get(tid, tid)}:{c}"
+                for (k, o, tid), c in top
+            )
+        )
 
     return tiles
 
 
-# Walkable tile types (all ground tiles are walkable)
-WALKABLE_TILES = set(range(19))  # 0-18 all walkable
+# Walkable tile types (ground-only test uses only walkable tile IDs; keep broad for dynamic registration)
+WALKABLE_TILES = set(range(256))
 
 
 def find_zombie_spawns(tiles, width, height, player_spawn, count, rng, min_dist=80):
@@ -394,49 +783,53 @@ def build_game(client, seed=42):
     # 1a. Background color — olive green to match tileset aesthetic
     post("/window", {"background": [0.38, 0.40, 0.30]})
 
-    # 1b. Register custom tile types with isometric tilesets
+    # 1b. Register directional ground tiles (A1 + G1..G10 with authored NESW variants)
     print("   Registering tile types with tilesets...")
-    gen = "sprites/tilesets/generated"
+    gen = "sprites/tilesets/generated"  # still used later for non-ground decoration assets
+    src_rel = "sprites/tilesets/rural_tileset/Isometric Tiles"
 
-    def ground_tileset(name):
-        return {"path": f"{gen}/{name}", "tile_width": 128, "tile_height": 256, "columns": 1, "rows": 1}
+    def ground_tileset_from_key(tile_key):
+        base = _tile_key_to_name(tile_key)
+        if not base:
+            return None
+        return {"path": f"{src_rel}/{base}.png", "tile_width": 128, "tile_height": 256, "columns": 1, "rows": 1}
 
-    # IDs 0-7 are reserved (engine hardcodes: 0=Empty, 1=Solid, 3=Goal, etc.)
-    # Ground tiles start at ID 8 to avoid built-in collision/teleport behavior.
-    #
-    # Tile IDs:
-    #   0-7  = engine reserved (filled with dummy walkable entries)
-    #   8    = A1  (full dirt)
-    #   9    = G1  (full grass)
-    #   10   = G2  (dirt edge N)
-    #   11   = G3  (dirt edge E)
-    #   12   = G4  (dirt edge S)
-    #   13   = G5  (dirt edge W)
-    #   14   = G6  (dirt corner NE)
-    #   15   = G7  (dirt corner SE)
-    #   16   = G8  (dirt corner SW)
-    #   17   = G9  (dirt corner NW)
-    #   18   = G10 (sparse grass on dirt)
     tile_types = []
-    # 0-7: reserved slots (all walkable, no tileset — won't be used)
+    tile_ids = {}
     for i in range(8):
         tile_types.append({"name": f"reserved_{i}", "flags": 0, "color": None})
-    # 8: A1 dirt
-    tile_types.append({"name": "dirt", "flags": 0, "color": [0.30, 0.25, 0.18],
-                        "tileset": ground_tileset("Ground_A1.png")})
-    # 9-18: G1-G10
-    for i in range(1, 11):
-        tile_types.append({
-            "name": f"grass_g{i}",
-            "flags": 0,
-            "color": [0.35, 0.52, 0.28],
-            "tileset": ground_tileset(f"Ground_G{i}.png"),
-        })
+
+    next_id = 8
+    for mat_series, mat_count, mat_label, mat_color in MATERIAL_FAMILIES:
+        for i in range(1, mat_count + 1):
+            for d in ("N", "E", "S", "W"):
+                key = f"{mat_series}{i}_{d}"
+                ts = ground_tileset_from_key(key)
+                if not ts:
+                    continue
+                name = f"{mat_label}_{mat_series.lower()}{i}_{d.lower()}"
+                tile_types.append({"name": name, "flags": 0, "color": mat_color, "tileset": ts})
+                tile_ids[key] = next_id
+                next_id += 1
     post("/config/tile_types", {"types": tile_types})
+    print(f"   Registered {len(tile_ids)} directional ground tiles ({len(tile_types)} total incl. reserved)")
 
     # 2. Generate world
     print(f"2. Generating {MAP_W}x{MAP_H} open world (isometric)...")
-    tiles = generate_world(MAP_W, MAP_H, seed)
+    # Load material primitive profiles
+    material_profiles = {}
+    if USE_PRIMITIVE_RUNTIME_PROFILE:
+        for mat_series, mat_subdir in MATERIAL_PROFILES.items():
+            profile_path = PRIMITIVE_TEACHER_DIR / mat_subdir / "border_primitives_runtime.json"
+            profile = load_primitive_runtime_profile(profile_path, tile_ids)
+            if profile:
+                material_profiles[mat_series] = profile
+    grass_primitive_profile_ids = material_profiles.get("G")
+    if RECTANGLE_EDGE_DEBUG_TEST:
+        print(f"   Primitive debug mode: rectangle test (step={PRIMITIVE_DEBUG_STEP or 'all'})")
+    tiles = generate_world(MAP_W, MAP_H, seed, tile_ids=tile_ids,
+                           grass_primitive_profile_ids=grass_primitive_profile_ids,
+                           material_profiles=material_profiles)
     spawn_x, spawn_y = iso_grid_to_world(MAP_W // 2, MAP_H // 2)
     print(f"   Player spawn: ({spawn_x:.0f}, {spawn_y:.0f})")
 
@@ -466,22 +859,32 @@ def build_game(client, seed=42):
             pass
 
     # 5. Upload scripts
-    print("5. Uploading scripts...")
-    scripts_dir = Path(__file__).parent / "scripts"
-    scripts = [
-        ("zombie_ai", "zombie_ai.lua", False),
-        ("zombie_manager", "zombie_manager.lua", True),
-        ("player_combat", "player_combat.lua", False),
-        ("game_rules", "game_rules.lua", True),
-        ("game_restart", "game_restart.lua", True),
-    ]
-    for name, filename, is_global in scripts:
-        path = scripts_dir / filename
-        if path.exists():
-            ok = load_script(client, name, str(path), global_script=is_global)
-            print(f"   {'OK' if ok else 'FAIL'}: {name} ({'global' if is_global else 'entity'})")
+    if TILE_TEST_MODE:
+        print("5. Loading player script only (tile test mode)...")
+        scripts_dir = Path(__file__).parent / "scripts"
+        combat_path = scripts_dir / "player_combat.lua"
+        if combat_path.exists():
+            ok = load_script(client, "player_combat", str(combat_path), global_script=False)
+            print(f"   {'OK' if ok else 'FAIL'}: player_combat (entity)")
         else:
-            print(f"   SKIP: {filename} (not found)")
+            print("   SKIP: player_combat.lua (not found)")
+    else:
+        print("5. Uploading scripts...")
+        scripts_dir = Path(__file__).parent / "scripts"
+        scripts = [
+            ("zombie_ai", "zombie_ai.lua", False),
+            ("zombie_manager", "zombie_manager.lua", True),
+            ("player_combat", "player_combat.lua", False),
+            ("game_rules", "game_rules.lua", True),
+            ("game_restart", "game_restart.lua", True),
+        ]
+        for name, filename, is_global in scripts:
+            path = scripts_dir / filename
+            if path.exists():
+                ok = load_script(client, name, str(path), global_script=is_global)
+                print(f"   {'OK' if ok else 'FAIL'}: {name} ({'global' if is_global else 'entity'})")
+            else:
+                print(f"   SKIP: {filename} (not found)")
 
     # 6. HUD
     print("6. Creating HUD...")
@@ -1056,7 +1459,8 @@ def build_game(client, seed=42):
     for i in range(3):
         try:
             resp = get("/screenshot")
-            path = resp.get("data", "")
+            data = resp.get("data", "")
+            path = data.get("path", data) if isinstance(data, dict) else data
             print(f"  Screenshot {i+1}: {path}")
         except Exception as e:
             print(f"  Screenshot {i+1}: failed ({e})")
