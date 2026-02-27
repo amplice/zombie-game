@@ -27,7 +27,7 @@ TILE_TEST_MODE = True  # True = small map, no scripts/zombies/loot, ground tiles
 
 # ── Map dimensions ──────────────────────────────────────────────────
 TILE_SIZE = 32
-MAP_W, MAP_H = (40, 40) if TILE_TEST_MODE else (200, 140)
+MAP_W, MAP_H = (400, 400) if TILE_TEST_MODE else (600, 420)
 
 # ── Isometric tile dimensions ────────────────────────────────────────
 ISO_TILE_W = 128   # Diamond base width (pixels)
@@ -343,12 +343,16 @@ def generate_world(width, height, seed=42):
 
         # ── Step 2: Grass blobs (buffered away from roads) ───────────
         road_buf = compute_buffer("B")
+        min_dim = min(width, height)
+        n_grass = max(12, width * height // 1400)
+        grass_r_lo = max(4, min_dim // 30)
+        grass_r_hi = max(grass_r_lo + 2, min_dim // 10)
         grass_blobs = []
-        for _ in range(12):
+        for _ in range(n_grass):
             cx = rng.randint(3, width - 4)
             cy = rng.randint(3, height - 4)
-            rx = rng.randint(4, 12)
-            ry = rng.randint(4, 12)
+            rx = rng.randint(grass_r_lo, grass_r_hi)
+            ry = rng.randint(grass_r_lo, grass_r_hi)
             grass_blobs.append((cx, cy, rx, ry))
 
         for y in range(height):
@@ -384,14 +388,20 @@ def generate_world(width, height, seed=42):
         # ── Step 3: Water blobs (buffered away from grass + roads) ───
         grass_buf = compute_buffer("G")
         water_exclude = combine_buffers(grass_buf, road_buf)
-        place_blobs("A", water_exclude, n_blobs=4, r_range=(3, 7))
+        n_water = max(4, width * height // 4000)
+        water_r_lo = max(3, min_dim // 40)
+        water_r_hi = max(water_r_lo + 2, min_dim // 15)
+        place_blobs("A", water_exclude, n_blobs=n_water, r_range=(water_r_lo, water_r_hi))
         remove_thin_strips("A")
 
         # ── Step 4: Gravel blobs (buffered away from all above) ──────
         if "E" in MATERIAL_TO_TILE_ID:
             water_buf = compute_buffer("A")
             gravel_exclude = combine_buffers(grass_buf, water_buf, road_buf)
-            place_blobs("E", gravel_exclude, n_blobs=6, r_range=(2, 5), min_sep=5)
+            n_gravel = max(6, width * height // 3000)
+            gravel_r_lo = max(2, min_dim // 50)
+            gravel_r_hi = max(gravel_r_lo + 2, min_dim // 20)
+            place_blobs("E", gravel_exclude, n_blobs=n_gravel, r_range=(gravel_r_lo, gravel_r_hi), min_sep=5)
             remove_thin_strips("E")
 
     # ── Convert material map to tile IDs ─────────────────────────────
@@ -402,7 +412,7 @@ def generate_world(width, height, seed=42):
     print(f"   Material cells: {parts}")
 
     tiles = [MATERIAL_TO_TILE_ID[m] for m in material_map]
-    return tiles, road_overlay
+    return tiles, road_overlay, material_map
 
 
 # Walkable tile types (ground-only test uses only walkable tile IDs; keep broad for dynamic registration)
@@ -449,134 +459,118 @@ def find_loot_spawns(tiles, width, height, rng, count=20):
 
 # ── Decoration placement ───────────────────────────────────────────
 
-def find_decoration_positions(tiles, width, height, rng):
-    """Scan generated tiles to find positions for decoration entities.
+def find_decoration_positions(tiles, material_map, width, height, rng):
+    """Place decoration entities on the terrain-only world using material_map.
+
+    Trees and flora go on grass ("G"), objects go on dirt/gravel ("D"/"E").
+    All decorations are spaced out and return world-coordinate positions.
     Returns dict of category -> list of (world_x, world_y) positions.
-    Also modifies tiles in-place: converts some tree solid tiles to grass.
     """
     tree_positions = []
-    car_positions = []
     flora_positions = []
     object_positions = []
-    fence_entity_positions = []
 
     def idx(tx, ty):
         return ty * width + tx
 
-    def get(tx, ty):
+    def mat_at(tx, ty):
         if 0 <= tx < width and 0 <= ty < height:
-            return tiles[idx(tx, ty)]
-        return 1
+            return material_map[idx(tx, ty)]
+        return "D"
 
-    def count_neighbors(tx, ty, tile_type):
-        """Count orthogonal + diagonal neighbors of given type."""
-        n = 0
+    # ── Collect candidate tiles by material ──
+    grass_tiles = []
+    dirt_gravel_tiles = []
+    for ty in range(3, height - 3):
+        for tx in range(3, width - 3):
+            m = material_map[idx(tx, ty)]
+            if m == "G":
+                grass_tiles.append((tx, ty))
+            elif m in ("D", "E"):
+                # Not on roads
+                if mat_at(tx, ty) != "B":
+                    dirt_gravel_tiles.append((tx, ty))
+
+    # ── Trees: on grass, min 3-tile spacing ──
+    rng.shuffle(grass_tiles)
+    max_trees = min(2000, len(grass_tiles) // 40)
+    occupied = set()
+    for tx, ty in grass_tiles:
+        if len(tree_positions) >= max_trees:
+            break
+        # Check min spacing of 3 tiles from other trees
+        too_close = False
+        for dx in range(-3, 4):
+            for dy in range(-3, 4):
+                if (tx + dx, ty + dy) in occupied:
+                    too_close = True
+                    break
+            if too_close:
+                break
+        if too_close:
+            continue
+        occupied.add((tx, ty))
+        wx, wy = iso_grid_to_world(tx, ty)
+        tree_positions.append((wx, wy))
+
+    # ── Flora: on grass, not adjacent to water, min 2-tile spacing ──
+    rng.shuffle(grass_tiles)
+    max_flora = min(1500, len(grass_tiles) // 30)
+    flora_occupied = set()
+    for tx, ty in grass_tiles:
+        if len(flora_positions) >= max_flora:
+            break
+        # Skip if adjacent to water
+        near_water = False
         for dx in range(-1, 2):
             for dy in range(-1, 2):
-                if dx == 0 and dy == 0:
-                    continue
-                if get(tx + dx, ty + dy) == tile_type:
-                    n += 1
-        return n
-
-    # Tile constants (must match generate_world)
-    T_WALL = 1
-    T_GRASS = 2
-    T_EARTH_DARK = 3
-    T_ROAD = 6
-    T_GRAVEL = 7
-    T_FLOOR = 9
-    T_FENCE = 10
-
-    # ── Trees: find isolated solid tiles (scattered forest, not building walls) ──
-    tree_candidates = []
-    for ty in range(2, height - 2):
-        for tx in range(2, width - 2):
-            if tiles[idx(tx, ty)] != T_WALL:
-                continue
-            solid_neighbors = count_neighbors(tx, ty, T_WALL)
-            floor_neighbors = count_neighbors(tx, ty, T_FLOOR)
-            if floor_neighbors == 0 and solid_neighbors <= 3:
-                tree_candidates.append((tx, ty))
-
-    rng.shuffle(tree_candidates)
-    for i, (tx, ty) in enumerate(tree_candidates):
-        tiles[idx(tx, ty)] = T_EARTH_DARK  # Remove wall tile — earth underneath (forest)
-        if i < 250:
-            wx, wy = iso_grid_to_world(tx, ty)
-            tree_positions.append((wx, wy))
-
-    # ── Cars: place along roads near buildings ──
-    car_candidates = []
-    for ty in range(2, height - 2):
-        for tx in range(2, width - 2):
-            if tiles[idx(tx, ty)] != T_ROAD:
-                continue
-            near_building = False
-            for dx in range(-5, 6):
-                for dy in range(-5, 6):
-                    if get(tx + dx, ty + dy) == T_WALL:
-                        near_building = True
-                        break
-                if near_building:
+                if mat_at(tx + dx, ty + dy) == "A":
+                    near_water = True
                     break
-            if near_building:
-                car_candidates.append((tx, ty))
-    rng.shuffle(car_candidates)
-    # Space cars out (min 8 tiles apart)
-    for tx, ty in car_candidates:
-        wx, wy = iso_grid_to_world(tx, ty)
+            if near_water:
+                break
+        if near_water:
+            continue
+        # Skip if too close to another flora or a tree
         too_close = False
-        for cx, cy in car_positions:
-            if abs(wx - cx) < 8 * ISO_TILE_W and abs(wy - cy) < 8 * ISO_TILE_H:
-                too_close = True
-                break
-        if not too_close:
-            car_positions.append((wx, wy))
-            if len(car_positions) >= 20:
-                break
-
-    # ── Flora: scatter on grass tiles, away from buildings ──
-    flora_candidates = []
-    for ty in range(2, height - 2):
-        for tx in range(2, width - 2):
-            if tiles[idx(tx, ty)] != T_GRASS:
-                continue
-            wall_near = False
-            for dx in range(-2, 3):
-                for dy in range(-2, 3):
-                    if get(tx + dx, ty + dy) in (T_WALL, T_FENCE):
-                        wall_near = True
-                        break
-                if wall_near:
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                key = (tx + dx, ty + dy)
+                if key in flora_occupied or key in occupied:
+                    too_close = True
                     break
-            if not wall_near:
-                flora_candidates.append((tx, ty))
-    rng.shuffle(flora_candidates)
-    for tx, ty in flora_candidates[:200]:
+            if too_close:
+                break
+        if too_close:
+            continue
+        flora_occupied.add((tx, ty))
         wx, wy = iso_grid_to_world(tx, ty)
         flora_positions.append((wx, wy))
 
-    # ── Objects: scatter inside buildings (floor tiles adjacent to 2+ walls) ──
-    obj_candidates = []
-    for ty in range(2, height - 2):
-        for tx in range(2, width - 2):
-            if tiles[idx(tx, ty)] != T_FLOOR:
-                continue
-            wall_count = 0
-            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                if get(tx + dx, ty + dy) == T_WALL:
-                    wall_count += 1
-            if wall_count >= 2:  # Corner of a room
-                obj_candidates.append((tx, ty))
-    rng.shuffle(obj_candidates)
-    for tx, ty in obj_candidates[:50]:
+    # ── Objects: on dirt/gravel (not roads), min 4-tile spacing ──
+    rng.shuffle(dirt_gravel_tiles)
+    max_objects = min(500, len(dirt_gravel_tiles) // 80)
+    obj_occupied = set()
+    for tx, ty in dirt_gravel_tiles:
+        if len(object_positions) >= max_objects:
+            break
+        too_close = False
+        for dx in range(-4, 5):
+            for dy in range(-4, 5):
+                if (tx + dx, ty + dy) in obj_occupied:
+                    too_close = True
+                    break
+            if too_close:
+                break
+        if too_close:
+            continue
+        obj_occupied.add((tx, ty))
         wx, wy = iso_grid_to_world(tx, ty)
         object_positions.append((wx, wy))
 
     return {
         "trees": tree_positions,
-        "cars": car_positions,
+        "cars": [],  # No cars in terrain-only world
         "flora": flora_positions,
         "objects": object_positions,
     }
@@ -680,18 +674,23 @@ def build_game(client, seed=42):
         }
         if info.get("columns", 13) != 13:
             mat_req["columns"] = info["columns"]
+        # Water (series "A") should be unwalkable
+        if series == "A":
+            mat_req["solid"] = True
         post("/terrain/materials", mat_req)
         cols = info.get("columns", 13)
         print(f"   Registered {info['label']} (tile_id={info['tile_id']}, columns={cols}) with atlas: {info['atlas_rel']}")
 
     # 2. Generate world
     print(f"2. Generating {MAP_W}x{MAP_H} open world (isometric)...")
-    tiles, road_overlay = generate_world(MAP_W, MAP_H, seed)
+    tiles, road_overlay, material_map = generate_world(MAP_W, MAP_H, seed)
     spawn_x, spawn_y = iso_grid_to_world(MAP_W // 2, MAP_H // 2)
     print(f"   Player spawn: ({spawn_x:.0f}, {spawn_y:.0f})")
 
-    # 2b. Decorations disabled — focusing on ground tiles only
-    decorations = {"trees": [], "cars": [], "flora": [], "objects": []}
+    # 2b. Place decorations on terrain
+    print("   Placing decorations...")
+    decorations = find_decoration_positions(tiles, material_map, MAP_W, MAP_H, rng)
+    print(f"   Trees: {len(decorations['trees'])}, Flora: {len(decorations['flora'])}, Objects: {len(decorations['objects'])}")
 
     # 3. Load level
     print("3. Loading level...")
@@ -1211,6 +1210,7 @@ def build_game(client, seed=42):
             "tags": ["decoration", "tree"],
             "components": [
                 {"type": "collider", "width": 20, "height": 20},
+                {"type": "solid_body"},
                 {"type": "animation_controller", "graph": variant, "auto_from_velocity": False},
             ],
         })
@@ -1230,7 +1230,7 @@ def build_game(client, seed=42):
         })
         deco_count += 1
 
-    # Flora — small non-collidable decorations on grass
+    # Flora — small collidable decorations on grass (unwalkable)
     for wx, wy in decorations["flora"]:
         variant = rng.choice(flora_variants)
         post("/entities", {
@@ -1238,12 +1238,14 @@ def build_game(client, seed=42):
             "is_player": False,
             "tags": ["decoration", "flora"],
             "components": [
+                {"type": "collider", "width": 10, "height": 10},
+                {"type": "solid_body"},
                 {"type": "animation_controller", "graph": variant, "auto_from_velocity": False},
             ],
         })
         deco_count += 1
 
-    # Objects — small collidable decorations inside buildings
+    # Objects — small collidable decorations on dirt/gravel (unwalkable)
     for wx, wy in decorations["objects"]:
         variant = rng.choice(object_variants)
         post("/entities", {
@@ -1252,6 +1254,7 @@ def build_game(client, seed=42):
             "tags": ["decoration", "object"],
             "components": [
                 {"type": "collider", "width": 14, "height": 14},
+                {"type": "solid_body"},
                 {"type": "animation_controller", "graph": variant, "auto_from_velocity": False},
             ],
         })
