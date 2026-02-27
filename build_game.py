@@ -27,7 +27,7 @@ TILE_TEST_MODE = True  # True = small map, no scripts/zombies/loot, ground tiles
 
 # ── Map dimensions ──────────────────────────────────────────────────
 TILE_SIZE = 32
-MAP_W, MAP_H = (400, 400) if TILE_TEST_MODE else (600, 420)
+MAP_W, MAP_H = (60, 60) if TILE_TEST_MODE else (600, 420)
 
 # ── Isometric tile dimensions ────────────────────────────────────────
 ISO_TILE_W = 128   # Diamond base width (pixels)
@@ -51,6 +51,21 @@ T_ROAD_CENTER_H = 200  # Horizontal corridor center → B14_E
 T_ROAD_CENTER_V = 201  # Vertical corridor center → B14_N
 ROAD_CENTER_H_TILE = "sprites/tilesets/rural_tileset/Isometric Tiles/Ground B14_E.png"
 ROAD_CENTER_V_TILE = "sprites/tilesets/rural_tileset/Isometric Tiles/Ground B14_N.png"
+
+# Flora overlay tile IDs — placed as extra_layer on top of ground tiles.
+# Flora B (green, under A trees) and Flora E (brown, under B/C trees).
+# Variants: 1/4 = full tiles, 2 = edge, 5 = outside corner, 6 = inside corner.
+# Directions: N/E/S/W control rotation.
+FLORA_TILE_IDS = {}
+_next_flora_id = 210
+for _series in ["B", "E"]:
+    for _var in [1, 2, 4, 5, 6]:
+        for _d in ["N", "E", "S", "W"]:
+            key = f"flora_{_series.lower()}{_var}_{_d.lower()}"
+            FLORA_TILE_IDS[key] = _next_flora_id
+            _next_flora_id += 1
+
+FLORA_GEN_DIR = "sprites/tilesets/generated"
 
 # Autotile atlas directory (produced by autotile_slot_tool.py Export button).
 AUTOTILE_ATLAS_DIR = Path(
@@ -344,9 +359,9 @@ def generate_world(width, height, seed=42):
         # ── Step 2: Grass blobs (buffered away from roads) ───────────
         road_buf = compute_buffer("B")
         min_dim = min(width, height)
-        n_grass = max(12, width * height // 1400)
-        grass_r_lo = max(4, min_dim // 30)
-        grass_r_hi = max(grass_r_lo + 2, min_dim // 10)
+        n_grass = max(20, width * height // 600)
+        grass_r_lo = max(5, min_dim // 20)
+        grass_r_hi = max(grass_r_lo + 3, min_dim // 8)
         grass_blobs = []
         for _ in range(n_grass):
             cx = rng.randint(3, width - 4)
@@ -460,11 +475,11 @@ def find_loot_spawns(tiles, width, height, rng, count=20):
 # ── Decoration placement ───────────────────────────────────────────
 
 def find_decoration_positions(tiles, material_map, width, height, rng):
-    """Place decoration entities on the terrain-only world using material_map.
+    """Biome-aware clustered decoration placement.
 
-    Trees and flora go on grass ("G"), objects go on dirt/gravel ("D"/"E").
-    All decorations are spaced out and return world-coordinate positions.
-    Returns dict of category -> list of (world_x, world_y) positions.
+    Trees form forest clumps on grass. Flora A placed as understory near trees
+    and scattered on grass. Flora B placed along road edges.
+    Returns dict of category -> list of (world_x, world_y, variant_name).
     """
     tree_positions = []
     flora_positions = []
@@ -478,101 +493,313 @@ def find_decoration_positions(tiles, material_map, width, height, rng):
             return material_map[idx(tx, ty)]
         return "D"
 
+    # ── Variant pools ──
+    TREES_LUSH = [f"tree_a{i}" for i in range(5, 11)]       # 6 variants (A5-A10)
+    TREES_AUTUMN = [f"tree_b{i}" for i in range(1, 3)]      # 2 variants (B1-B2)
+    TREES_EVERGREEN = [f"tree_c{i}" for i in range(1, 3)]   # 2 variants (C1-C2)
+    FLORA_A = [f"flora_a{i}" for i in [1,2,3,4,5,6,7,8,9,10,11,12,15,16,17,18,19,20]]
+    FLORA_B = [f"flora_b{i}" for i in range(1, 20)]
+
     # ── Collect candidate tiles by material ──
     grass_tiles = []
+    grass_set = set()
+    dirt_set = set()
+    road_tiles = []
+    road_edge_tiles = []
     dirt_gravel_tiles = []
     for ty in range(3, height - 3):
         for tx in range(3, width - 3):
             m = material_map[idx(tx, ty)]
             if m == "G":
                 grass_tiles.append((tx, ty))
+                grass_set.add((tx, ty))
+            elif m == "B":
+                road_tiles.append((tx, ty))
+                # Check if this road tile is at an edge (adjacent to non-road)
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nbr = mat_at(tx + dx, ty + dy)
+                    if nbr != "B":
+                        road_edge_tiles.append((tx, ty))
+                        break
             elif m in ("D", "E"):
-                # Not on roads
-                if mat_at(tx, ty) != "B":
-                    dirt_gravel_tiles.append((tx, ty))
+                dirt_gravel_tiles.append((tx, ty))
+                dirt_set.add((tx, ty))  # Flora E goes on both dirt and gravel
 
-    # ── Trees: on grass, min 3-tile spacing ──
-    rng.shuffle(grass_tiles)
-    max_trees = min(2000, len(grass_tiles) // 40)
-    occupied = set()
-    for tx, ty in grass_tiles:
+    # Global occupied set for spacing checks
+    tree_occupied = set()
+    flora_occupied = set()
+
+    def is_clear_of(tx, ty, occupied_set, min_dist):
+        """Check if (tx,ty) is at least min_dist from any tile in occupied_set."""
+        for dx in range(-min_dist, min_dist + 1):
+            for dy in range(-min_dist, min_dist + 1):
+                if (tx + dx, ty + dy) in occupied_set:
+                    return False
+        return True
+
+    # ── Flora patches: terrain-based, partial coverage ──
+    # Flora B on grass, Flora E on dirt. Generated BEFORE trees so trees
+    # can be constrained to only spawn on flora patch cells.
+
+    def make_flora_blobs(candidate_set, coverage=0.65):
+        """Create organic flora blobs covering ~coverage fraction of candidates."""
+        candidates = list(candidate_set)
+        rng.shuffle(candidates)
+        target = int(len(candidates) * coverage)
+        blob_cells = set()
+        n_seeds = max(3, len(candidates) // 40)
+        seed_pts = candidates[:n_seeds]
+        blob_radius = max(3, min(width, height) // 12)
+        for sx, sy in seed_pts:
+            r = rng.randint(max(2, blob_radius - 2), blob_radius + 2)
+            for ddx in range(-r, r + 1):
+                for ddy in range(-r, r + 1):
+                    nx, ny = sx + ddx, sy + ddy
+                    if (nx, ny) not in candidate_set:
+                        continue
+                    dist = (ddx * ddx + ddy * ddy) ** 0.5
+                    if dist < r + rng.random() * 2 - 1:
+                        blob_cells.add((nx, ny))
+            if len(blob_cells) >= target:
+                break
+        return blob_cells
+
+    def remove_singletons(cells):
+        """Remove cells with no cardinal neighbors in the set."""
+        return {(tx, ty) for tx, ty in cells
+                if any((tx + dx, ty + dy) in cells
+                       for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)])}
+
+    # Build buffer zones: exclude cells within 3 tiles of incompatible terrain
+    FLORA_BUFFER = 3
+    incompatible_for_grass = set()  # grass flora shouldn't be near water, roads
+    incompatible_for_dirt = set()   # dirt flora shouldn't be near water, roads
+    for ty in range(height):
+        for tx in range(width):
+            m = material_map[idx(tx, ty)]
+            if m in ("A", "B", "C"):  # water, road, stone
+                for ddx in range(-FLORA_BUFFER, FLORA_BUFFER + 1):
+                    for ddy in range(-FLORA_BUFFER, FLORA_BUFFER + 1):
+                        incompatible_for_grass.add((tx + ddx, ty + ddy))
+                        incompatible_for_dirt.add((tx + ddx, ty + ddy))
+            elif m == "D":  # dirt is incompatible neighbor for grass flora
+                for ddx in range(-FLORA_BUFFER, FLORA_BUFFER + 1):
+                    for ddy in range(-FLORA_BUFFER, FLORA_BUFFER + 1):
+                        incompatible_for_grass.add((tx + ddx, ty + ddy))
+            elif m == "G":  # grass is incompatible neighbor for dirt flora
+                for ddx in range(-FLORA_BUFFER, FLORA_BUFFER + 1):
+                    for ddy in range(-FLORA_BUFFER, FLORA_BUFFER + 1):
+                        incompatible_for_dirt.add((tx + ddx, ty + ddy))
+
+    buffered_grass = grass_set - incompatible_for_grass
+    buffered_dirt = dirt_set - incompatible_for_dirt
+
+    flora_b_patch = remove_singletons(make_flora_blobs(buffered_grass, coverage=0.3))
+    flora_e_patch = remove_singletons(make_flora_blobs(buffered_dirt, coverage=0.4))
+    flora_patch_all = flora_b_patch | flora_e_patch
+
+    # ── TREES: Dense forest clumps (only on flora patches) ──
+    flora_patch_list = list(flora_patch_all)
+    rng.shuffle(flora_patch_list)
+    n_patch = len(flora_patch_all)
+    # Very dense: ~1 tree per 3 flora patch tiles, tightly packed clusters
+    max_trees = min(8000, max(n_patch // 3, 50))
+    min_dim = min(width, height)
+    seed_spacing = max(2, min_dim // 15)  # very tight seeds
+    n_seeds = max(8, n_patch // 10)
+
+    # Pick seed positions (only from dense interior of flora patches)
+    seed_positions = []
+    seed_set = set()
+    for tx, ty in flora_patch_list:
+        if len(seed_positions) >= n_seeds:
+            break
+        # Seed must be deep inside a flora patch
+        nearby = sum(1 for ddx in range(-2, 3) for ddy in range(-2, 3)
+                     if (tx + ddx, ty + ddy) in flora_patch_all)
+        if nearby < 15:
+            continue
+        if is_clear_of(tx, ty, seed_set, seed_spacing):
+            seed_positions.append((tx, ty))
+            seed_set.add((tx, ty))
+
+    # Assign cluster type based on which flora patch the seed is in:
+    # Flora B patch (grass) → lush trees (A), Flora E patch (dirt) → autumn/evergreen (B/C)
+    cluster_types = []
+    for sx, sy in seed_positions:
+        if (sx, sy) in flora_b_patch:
+            cluster_types.append(("lush", TREES_LUSH))
+        else:
+            # On dirt (flora E patch) — 50/50 autumn vs evergreen
+            if rng.random() < 0.5:
+                cluster_types.append(("autumn", TREES_AUTUMN))
+            else:
+                cluster_types.append(("evergreen", TREES_EVERGREEN))
+
+    # Scatter trees densely around each seed
+    for (sx, sy), (ctype, variants) in zip(seed_positions, cluster_types):
         if len(tree_positions) >= max_trees:
             break
-        # Check min spacing of 3 tiles from other trees
-        too_close = False
-        for dx in range(-3, 4):
-            for dy in range(-3, 4):
-                if (tx + dx, ty + dy) in occupied:
-                    too_close = True
-                    break
-            if too_close:
+        cluster_size = rng.randint(10, 25)
+        cluster_radius = rng.randint(2, 4)
+        placed = 0
+        attempts = 0
+        while placed < cluster_size and attempts < cluster_size * 6:
+            attempts += 1
+            dx = rng.randint(-cluster_radius, cluster_radius)
+            dy = rng.randint(-cluster_radius, cluster_radius)
+            tx, ty = sx + dx, sy + dy
+            if not (3 <= tx < width - 3 and 3 <= ty < height - 3):
+                continue
+            if (tx, ty) not in flora_patch_all:
+                continue
+            # Only place tree if well inside a flora patch (not on thin edges)
+            nearby_flora = sum(1 for ddx in range(-1, 2) for ddy in range(-1, 2)
+                               if (tx + ddx, ty + ddy) in flora_patch_all)
+            if nearby_flora < 7:
+                continue
+            if (tx, ty) in tree_occupied:
+                continue
+            tree_occupied.add((tx, ty))
+            variant = rng.choice(variants)
+            wx, wy = iso_grid_to_world(tx, ty)
+            tree_positions.append((wx, wy, variant))
+            placed += 1
+            if len(tree_positions) >= max_trees:
                 break
-        if too_close:
-            continue
-        occupied.add((tx, ty))
-        wx, wy = iso_grid_to_world(tx, ty)
-        tree_positions.append((wx, wy))
 
-    # ── Flora: on grass, not adjacent to water, min 2-tile spacing ──
-    rng.shuffle(grass_tiles)
-    max_flora = min(1500, len(grass_tiles) // 30)
-    flora_occupied = set()
-    for tx, ty in grass_tiles:
-        if len(flora_positions) >= max_flora:
+    # ── FLORA A: Understory near trees + scattered on grass ──
+    max_flora_a = min(3000, len(grass_tiles) // 20)
+    flora_a_count = 0
+
+    # 60% near trees (understory)
+    understory_target = int(max_flora_a * 0.6)
+    tree_tile_positions = [(tx, ty) for tx, ty in tree_occupied]
+    rng.shuffle(tree_tile_positions)
+    for tree_tx, tree_ty in tree_tile_positions:
+        if flora_a_count >= understory_target:
             break
-        # Skip if adjacent to water
-        near_water = False
-        for dx in range(-1, 2):
-            for dy in range(-1, 2):
-                if mat_at(tx + dx, ty + dy) == "A":
-                    near_water = True
-                    break
-            if near_water:
+        # Try to place 1-3 flora near each tree
+        for _ in range(rng.randint(1, 3)):
+            if flora_a_count >= understory_target:
                 break
+            dx = rng.randint(-3, 3)
+            dy = rng.randint(-3, 3)
+            fx, fy = tree_tx + dx, tree_ty + dy
+            if not (3 <= fx < width - 3 and 3 <= fy < height - 3):
+                continue
+            if (fx, fy) not in grass_set:
+                continue
+            if (fx, fy) in tree_occupied:
+                continue
+            if not is_clear_of(fx, fy, flora_occupied, 1):
+                continue
+            # Skip if adjacent to water
+            near_water = any(mat_at(fx + ddx, fy + ddy) == "A"
+                             for ddx in range(-1, 2) for ddy in range(-1, 2))
+            if near_water:
+                continue
+            flora_occupied.add((fx, fy))
+            variant = rng.choice(FLORA_A)
+            wx, wy = iso_grid_to_world(fx, fy)
+            flora_positions.append((wx, wy, variant))
+            flora_a_count += 1
+
+    # 40% scattered on open grass
+    scatter_target = max_flora_a - flora_a_count
+    rng.shuffle(grass_tiles)
+    for tx, ty in grass_tiles:
+        if flora_a_count >= max_flora_a:
+            break
+        if (tx, ty) in tree_occupied:
+            continue
+        if not is_clear_of(tx, ty, flora_occupied, 2):
+            continue
+        near_water = any(mat_at(tx + ddx, ty + ddy) == "A"
+                         for ddx in range(-1, 2) for ddy in range(-1, 2))
         if near_water:
             continue
-        # Skip if too close to another flora or a tree
-        too_close = False
-        for dx in range(-2, 3):
-            for dy in range(-2, 3):
-                key = (tx + dx, ty + dy)
-                if key in flora_occupied or key in occupied:
-                    too_close = True
-                    break
-            if too_close:
-                break
-        if too_close:
-            continue
         flora_occupied.add((tx, ty))
+        variant = rng.choice(FLORA_A)
         wx, wy = iso_grid_to_world(tx, ty)
-        flora_positions.append((wx, wy))
+        flora_positions.append((wx, wy, variant))
+        flora_a_count += 1
+
+    # ── FLORA B: Bushes along road edges ──
+    rng.shuffle(road_edge_tiles)
+    max_flora_b = min(1500, len(road_edge_tiles) // 3)
+    flora_b_count = 0
+    for tx, ty in road_edge_tiles:
+        if flora_b_count >= max_flora_b:
+            break
+        # Place on adjacent non-road tile (grass or dirt side of the road edge)
+        candidates = []
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx, ny = tx + dx, ty + dy
+            if 3 <= nx < width - 3 and 3 <= ny < height - 3:
+                nbr = mat_at(nx, ny)
+                if nbr in ("G", "D", "E"):
+                    candidates.append((nx, ny))
+        if not candidates:
+            continue
+        fx, fy = rng.choice(candidates)
+        if (fx, fy) in tree_occupied or (fx, fy) in flora_occupied:
+            continue
+        if not is_clear_of(fx, fy, flora_occupied, 2):
+            continue
+        flora_occupied.add((fx, fy))
+        variant = rng.choice(FLORA_B)
+        wx, wy = iso_grid_to_world(fx, fy)
+        flora_positions.append((wx, wy, variant))
+        flora_b_count += 1
 
     # ── Objects: on dirt/gravel (not roads), min 4-tile spacing ──
+    OBJECT_VARIANTS = [f"object_{i}" for i in list(range(1, 5)) + list(range(16, 19)) + list(range(21, 24)) + [33] + list(range(39, 45))]
     rng.shuffle(dirt_gravel_tiles)
     max_objects = min(500, len(dirt_gravel_tiles) // 80)
     obj_occupied = set()
     for tx, ty in dirt_gravel_tiles:
         if len(object_positions) >= max_objects:
             break
-        too_close = False
-        for dx in range(-4, 5):
-            for dy in range(-4, 5):
-                if (tx + dx, ty + dy) in obj_occupied:
-                    too_close = True
-                    break
-            if too_close:
-                break
-        if too_close:
+        if not is_clear_of(tx, ty, obj_occupied, 4):
+            continue
+        if (tx, ty) in tree_occupied or (tx, ty) in flora_occupied:
+            continue
+        # Keep objects away from water
+        near_water = any(mat_at(tx + dx, ty + dy) == "A"
+                         for dx in range(-2, 3) for dy in range(-2, 3))
+        if near_water:
             continue
         obj_occupied.add((tx, ty))
+        variant = rng.choice(OBJECT_VARIANTS)
         wx, wy = iso_grid_to_world(tx, ty)
-        object_positions.append((wx, wy))
+        object_positions.append((wx, wy, variant))
+
+    # ── Cars: on or very near roads, min 4-tile spacing ──
+    CAR_VARIANTS = [f"car_{i}" for i in range(1, 11)]
+    car_positions = []
+    car_occupied = set()
+    rng.shuffle(road_tiles)
+    max_cars = min(100, max(len(road_tiles) // 30, 3))
+    for tx, ty in road_tiles:
+        if len(car_positions) >= max_cars:
+            break
+        if not is_clear_of(tx, ty, car_occupied, 4):
+            continue
+        if (tx, ty) in tree_occupied or (tx, ty) in obj_occupied:
+            continue
+        car_occupied.add((tx, ty))
+        variant = rng.choice(CAR_VARIANTS)
+        wx, wy = iso_grid_to_world(tx, ty)
+        car_positions.append((wx, wy, variant))
 
     return {
         "trees": tree_positions,
-        "cars": [],  # No cars in terrain-only world
+        "cars": car_positions,
         "flora": flora_positions,
         "objects": object_positions,
+        "flora_b_patch": flora_b_patch,
+        "flora_e_patch": flora_e_patch,
     }
 
 
@@ -663,6 +890,24 @@ def build_game(client, seed=42):
     })
     print(f"   Registered road center line tiles (h={T_ROAD_CENTER_H}, v={T_ROAD_CENTER_V})")
 
+    # Flora overlay tiles — registered as non-autotile single-frame materials.
+    print("   Registering flora overlay tiles...")
+    for key, tid in FLORA_TILE_IDS.items():
+        # key like "flora_b1_n" → file Flora_B1_N.png
+        parts = key.split("_")  # ["flora", "b1", "n"]
+        series_var = parts[1].upper()  # "B1"
+        direction = parts[2].upper()   # "N"
+        png_name = f"Flora_{series_var}_{direction}.png"
+        post("/terrain/materials", {
+            "name": key,
+            "tile_id": tid,
+            "atlas": f"{FLORA_GEN_DIR}/{png_name}",
+            "frame_width": 128,
+            "frame_height": 256,
+            "autotile": False,
+        })
+    print(f"   Registered {len(FLORA_TILE_IDS)} flora overlay tiles (IDs {min(FLORA_TILE_IDS.values())}-{max(FLORA_TILE_IDS.values())})")
+
     # All other materials: auto-discovered from AUTOTILE_ATLAS_DIR.
     for series, info in DISCOVERED_MATERIALS.items():
         mat_req = {
@@ -690,7 +935,7 @@ def build_game(client, seed=42):
     # 2b. Place decorations on terrain
     print("   Placing decorations...")
     decorations = find_decoration_positions(tiles, material_map, MAP_W, MAP_H, rng)
-    print(f"   Trees: {len(decorations['trees'])}, Flora: {len(decorations['flora'])}, Objects: {len(decorations['objects'])}")
+    print(f"   Trees: {len(decorations['trees'])}, Cars: {len(decorations['cars'])}, Flora: {len(decorations['flora'])}, Objects: {len(decorations['objects'])}")
 
     # 3. Load level
     print("3. Loading level...")
@@ -701,14 +946,72 @@ def build_game(client, seed=42):
         "player_spawn": [spawn_x, spawn_y],
         "goal": [int(v) for v in iso_grid_to_world(1, 1)],
     }
-    # Add road center line overlay as extra layer
+    # Add extra layers
+    extra_layers = []
+
+    # Road center line overlay
     if road_overlay and any(t != 0 for t in road_overlay):
-        level_data["extra_layers"] = [{
+        extra_layers.append({
             "name": "road_center_lines",
             "tiles": road_overlay,
             "z_offset": 0.01,
-        }]
+        })
         print(f"   Road center line overlay: {sum(1 for t in road_overlay if t != 0)} tiles")
+
+    # Flora overlay patches (under trees)
+    flora_b_patch = decorations["flora_b_patch"]
+    flora_e_patch = decorations["flora_e_patch"]
+    if flora_b_patch or flora_e_patch:
+        flora_overlay = [0] * (MAP_W * MAP_H)
+
+        def pick_flora_tile(tx, ty, patch_set, series):
+            """Pick flora tile using same direction mapping as ground autotiles.
+            B5/E5 = outside corners, B6/E6 = inside corners, B2/E2 = alt corner.
+            B1/B4 (E1/E4) = full tiles for everything else."""
+            has_n = (tx, ty - 1) in patch_set
+            has_s = (tx, ty + 1) in patch_set
+            has_w = (tx - 1, ty) in patch_set
+            has_e = (tx + 1, ty) in patch_set
+
+            p = series.lower()  # "b" or "e"
+
+            # Outside corner: exactly 2 adjacent cardinals present
+            # Direction mapping matches ground autotile (from gravel E3 example):
+            #   N+E present (SW exposed) → _e
+            #   E+S present (NW exposed) → _n
+            #   S+W present (NE exposed) → _w
+            #   W+N present (SE exposed) → _s
+            count = sum([has_n, has_s, has_w, has_e])
+            if count == 2 and not (has_n and has_s) and not (has_e and has_w):
+                v = rng.choice([2, 5, 6])  # outside corner variants
+                if has_n and has_e:
+                    return FLORA_TILE_IDS[f"flora_{p}{v}_e"]
+                elif has_e and has_s:
+                    return FLORA_TILE_IDS[f"flora_{p}{v}_n"]
+                elif has_s and has_w:
+                    return FLORA_TILE_IDS[f"flora_{p}{v}_w"]
+                else:  # has_w and has_n
+                    return FLORA_TILE_IDS[f"flora_{p}{v}_s"]
+
+            # Everything else (full, edges, inside corners, isolated) → full tile
+            v = rng.choice([1, 4])
+            d = rng.choice(["n", "e", "s", "w"])
+            return FLORA_TILE_IDS[f"flora_{p}{v}_{d}"]
+
+        for tx, ty in flora_b_patch:
+            flora_overlay[ty * MAP_W + tx] = pick_flora_tile(tx, ty, flora_b_patch, "B")
+        for tx, ty in flora_e_patch:
+            flora_overlay[ty * MAP_W + tx] = pick_flora_tile(tx, ty, flora_e_patch, "E")
+
+        extra_layers.append({
+            "name": "flora_overlay",
+            "tiles": flora_overlay,
+            "z_offset": 0.02,
+        })
+        print(f"   Flora overlay: {len(flora_b_patch)} B cells + {len(flora_e_patch)} E cells")
+
+    if extra_layers:
+        level_data["extra_layers"] = extra_layers
     post("/level", level_data)
 
     # 4. Clear entities
@@ -993,29 +1296,37 @@ def build_game(client, seed=42):
         "animations": zombie_anims("ZombieHulk1", 192, 192),
     })
 
-    # 7d. Register decoration sprite sheets (single-frame, idle-only, recentered)
+    # 7d. Register decoration sprite sheets (single-frame, idle-only, native sizes)
     print("   Registering decoration sprites...")
-    decoration_sheets = [
-        # Trees (256x512 → recentered + scaled to 128x256)
-        ("tree_a1", f"{gen}/Tree_A1.png", 128, 256),
-        ("tree_a2", f"{gen}/Tree_A2.png", 128, 256),
-        ("tree_a3", f"{gen}/Tree_A3.png", 128, 256),
-        ("tree_a4", f"{gen}/Tree_A4.png", 128, 256),
-        # Cars (256x512 → recentered + scaled to 128x256)
-        ("car_1", f"{gen}/Car1.png", 128, 256),
-        ("car_2", f"{gen}/Car2.png", 128, 256),
-        ("car_3", f"{gen}/Car3.png", 128, 256),
-        # Flora (128x256 → recentered + scaled to 64x128)
-        ("flora_a1", f"{gen}/Flora_A1.png", 64, 128),
-        ("flora_a10", f"{gen}/Flora_A10.png", 64, 128),
-        ("flora_a11", f"{gen}/Flora_A11.png", 64, 128),
-        ("flora_a12", f"{gen}/Flora_A12.png", 64, 128),
-        # Objects (128x256 → recentered + scaled to 64x128)
-        ("object_1", f"{gen}/Object1.png", 64, 128),
-        ("object_2", f"{gen}/Object2.png", 64, 128),
-        ("object_3", f"{gen}/Object3.png", 64, 128),
-        ("object_4", f"{gen}/Object4.png", 64, 128),
-    ]
+    decoration_sheets = []
+
+    # Trees A5-A10 (lush), B1-B2 (autumn), C1-C2 (evergreen) — 128x344 (diamond anchored)
+    for i in range(5, 11):
+        decoration_sheets.append((f"tree_a{i}", f"{gen}/Tree_A{i}.png", 128, 317))
+    for i in range(1, 3):
+        decoration_sheets.append((f"tree_b{i}", f"{gen}/Tree_B{i}.png", 128, 317))
+    for i in range(1, 3):
+        decoration_sheets.append((f"tree_c{i}", f"{gen}/Tree_C{i}.png", 128, 317))
+
+    # Tree shadow — single image for all trees — 546x512 native
+    decoration_sheets.append(("tree_shadow", f"{gen}/Tree_A3_Shadow.png", 546, 512))
+
+    # Flora A: general small plants (18 variants) — 128x256 native
+    for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 16, 17, 18, 19, 20]:
+        decoration_sheets.append((f"flora_a{i}", f"{gen}/Flora_A{i}.png", 128, 256))
+
+    # Flora B: bushes/shrubs for brown earth (19 variants) — 128x256 native
+    for i in range(1, 20):
+        decoration_sheets.append((f"flora_b{i}", f"{gen}/Flora_B{i}.png", 128, 256))
+
+    # Cars — 192x516 (diamond anchored, 10 variants)
+    for i in range(1, 11):
+        decoration_sheets.append((f"car_{i}", f"{gen}/Car{i}.png", 192, 476))
+
+    # Objects — 128x344 (diamond anchored, 1-4, 16-23, 33, 39-44)
+    for i in list(range(1, 5)) + list(range(16, 19)) + list(range(21, 24)) + [33] + list(range(39, 45)):
+        decoration_sheets.append((f"object_{i}", f"{gen}/Object{i}.png", 128, 317))
+
     for name, path, fw, fh in decoration_sheets:
         post("/sprites/sheets", {
             "name": name,
@@ -1193,17 +1504,15 @@ def build_game(client, seed=42):
         })
     print(f"   Placed {sum(loot_counts.values())} pickups: {loot_counts['health']} health, {loot_counts['ammo']} ammo, {loot_counts['weapon']} weapon")
 
-    # 11b. Spawn decoration entities
+    # 11b. Spawn decoration entities (variant selected by find_decoration_positions)
     print("   Spawning decorations...")
-    tree_variants = ["tree_a1", "tree_a2", "tree_a3", "tree_a4"]
-    car_variants = ["car_1", "car_2", "car_3"]
-    flora_variants = ["flora_a1", "flora_a10", "flora_a11", "flora_a12"]
-    object_variants = ["object_1", "object_2", "object_3", "object_4"]
     deco_count = 0
 
-    # Trees — large collidable decorations that block movement
-    for wx, wy in decorations["trees"]:
-        variant = rng.choice(tree_variants)
+    # Sprite images are now anchored so diamond base = canvas center.
+    # Entity position directly matches visual ground footprint.
+
+    # Trees
+    for wx, wy, variant in decorations["trees"]:
         post("/entities", {
             "x": wx, "y": wy,
             "is_player": False,
@@ -1216,44 +1525,28 @@ def build_game(client, seed=42):
         })
         deco_count += 1
 
-    # Cars — large collidable decorations along roads
-    for wx, wy in decorations["cars"]:
-        variant = rng.choice(car_variants)
+    # Cars — larger collider for vehicle footprint
+    for wx, wy, variant in decorations["cars"]:
         post("/entities", {
             "x": wx, "y": wy,
             "is_player": False,
             "tags": ["decoration", "car"],
             "components": [
-                {"type": "collider", "width": 40, "height": 24},
-                {"type": "animation_controller", "graph": variant, "auto_from_velocity": False},
-            ],
-        })
-        deco_count += 1
-
-    # Flora — small collidable decorations on grass (unwalkable)
-    for wx, wy in decorations["flora"]:
-        variant = rng.choice(flora_variants)
-        post("/entities", {
-            "x": wx, "y": wy,
-            "is_player": False,
-            "tags": ["decoration", "flora"],
-            "components": [
-                {"type": "collider", "width": 10, "height": 10},
+                {"type": "collider", "width": 100, "height": 60},
                 {"type": "solid_body"},
                 {"type": "animation_controller", "graph": variant, "auto_from_velocity": False},
             ],
         })
         deco_count += 1
 
-    # Objects — small collidable decorations on dirt/gravel (unwalkable)
-    for wx, wy in decorations["objects"]:
-        variant = rng.choice(object_variants)
+    # Objects
+    for wx, wy, variant in decorations["objects"]:
         post("/entities", {
             "x": wx, "y": wy,
             "is_player": False,
             "tags": ["decoration", "object"],
             "components": [
-                {"type": "collider", "width": 14, "height": 14},
+                {"type": "collider", "width": 30, "height": 30},
                 {"type": "solid_body"},
                 {"type": "animation_controller", "graph": variant, "auto_from_velocity": False},
             ],
