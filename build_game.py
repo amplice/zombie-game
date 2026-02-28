@@ -852,10 +852,13 @@ def build_game(client, seed=42):
         "asset_path": "C:/Users/cobra/zombie-game/assets",
     })
 
-    # 1a. Background color — olive green to match tileset aesthetic
-    post("/window", {"background": [0.38, 0.40, 0.30]})
+    # 1a. Background color — dark to match fog vignette edges (seamless darkness beyond sprite)
+    post("/window", {"background": [0.02, 0.012, 0.008]})
 
-    # 1b. Register terrain materials (auto-discovered from atlas directory)
+    # 1b. Fog of war — vignette sprite overlay (engine lighting disabled)
+    post("/lighting/config", {"enabled": False})
+
+    # 1c. Register terrain materials (auto-discovered from atlas directory)
     print("   Registering terrain materials...")
     gen = "sprites/tilesets/generated"
 
@@ -1036,6 +1039,12 @@ def build_game(client, seed=42):
             print(f"   {'OK' if ok else 'FAIL'}: player_combat (entity)")
         else:
             print("   SKIP: player_combat.lua (not found)")
+        fog_path = scripts_dir / "fog_overlay.lua"
+        if fog_path.exists():
+            ok = load_script(client, "fog_overlay", str(fog_path), global_script=False)
+            print(f"   {'OK' if ok else 'FAIL'}: fog_overlay (entity)")
+        else:
+            print("   SKIP: vision_cone.lua (not found)")
     else:
         print("5. Uploading scripts...")
         scripts_dir = Path(__file__).parent / "scripts"
@@ -1043,6 +1052,7 @@ def build_game(client, seed=42):
             ("zombie_ai", "zombie_ai.lua", False),
             ("zombie_manager", "zombie_manager.lua", True),
             ("player_combat", "player_combat.lua", False),
+            ("fog_overlay", "fog_overlay.lua", False),
             ("game_rules", "game_rules.lua", True),
             ("game_restart", "game_restart.lua", True),
         ]
@@ -1357,6 +1367,28 @@ def build_game(client, seed=42):
     player = post("/entities", player_def)
     player_id = player["data"]["id"]
     print(f"   Player id={player_id}")
+
+    # 8b. Register fog vignette sprite and spawn overlay entity
+    post("/sprites/sheets", {
+        "name": "fog_v2",
+        "path": "fog_v2.png",
+        "frame_width": 1536, "frame_height": 1536, "columns": 1, "rows": 1,
+        "anchor_y": 0.0,
+        "animations": {"idle": {"frames": [0], "fps": 1, "looping": True}},
+    })
+    post("/entities", {
+        "x": spawn_x,
+        "y": spawn_y,
+        "is_player": False,
+        "tags": ["fog_overlay"],
+        "script": "fog_overlay",
+        "components": [
+            {"type": "animation_controller", "graph": "fog_v2",
+             "auto_from_velocity": False},
+            {"type": "render_layer", "layer": 200},
+        ],
+    })
+    print("   Spawned fog overlay")
 
     # 9. Camera
     print("9. Setting up camera...")

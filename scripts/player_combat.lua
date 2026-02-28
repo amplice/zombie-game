@@ -52,6 +52,9 @@ function update(entity, world, dt)
     if dist > 1 then
         entity.state.facing_x = dx / dist
         entity.state.facing_y = dy / dist
+        -- Publish facing for vision cone light
+        world.set_var("facing_x", entity.state.facing_x)
+        world.set_var("facing_y", entity.state.facing_y)
         -- Quantize angle to 8 sectors (45° each, centered on cardinal/ordinal directions)
         local angle = math.atan2(dy, dx)
         local sector = math.floor((angle + math.pi + math.pi / 8) / (math.pi / 4)) % 8
